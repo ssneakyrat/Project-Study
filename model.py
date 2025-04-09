@@ -161,8 +161,8 @@ class Signal2DTo1DModel(pl.LightningModule):
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True)
         
         # Log visualizations every N steps
-        if batch_idx % self.hparams['logging']['log_every_n_steps'] == 0:
-            self._log_predictions(x, y, y_pred, 'train')
+        #if batch_idx % self.hparams['logging']['log_every_n_steps'] == 0:
+        #    self._log_predictions(x, y, y_pred, 'train')
         
         return loss
     
@@ -175,7 +175,8 @@ class Signal2DTo1DModel(pl.LightningModule):
         self.log('val_loss', val_loss, prog_bar=True, on_epoch=True)
         
         # Log visualizations
-        if batch_idx == 0:  # Only log the first batch
+        log_every = self.hparams['logging'].get('log_val_every_epoch', 1)  # Default to 1 if not set
+        if batch_idx == 0 and ( self.current_epoch % log_every == 0):
             self._log_predictions(x, y, y_pred, 'val')
         
         return val_loss

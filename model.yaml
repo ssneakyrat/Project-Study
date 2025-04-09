@@ -32,5 +32,6 @@ data:
 # Logging Configuration
 logging:
   log_every_n_steps: 10
+  log_val_every_epoch: 10  # Log validation predictions every 5 epochs
   tensorboard_log_dir: "logs"
   save_model_dir: "logs/checkpoints"
