@@ -8,6 +8,87 @@ import io
 from PIL import Image
 import torchvision.transforms as T
 
+class EnvelopeLoss(nn.Module):
+    """Loss function that compares signal envelopes rather than using FFT."""
+    def __init__(self, alpha=0.4, window_size=128):
+        super().__init__()
+        self.alpha = alpha
+        self.window_size = window_size
+        
+    def forward(self, pred, target):
+        # Regular MSE loss
+        direct_loss = F.mse_loss(pred, target)
+        
+        # Compute envelopes (absolute value + smoothing)
+        pred_env = self._compute_envelope(pred)
+        target_env = self._compute_envelope(target)
+        
+        # Envelope MSE
+        env_loss = F.mse_loss(pred_env, target_env)
+        
+        # Combined loss
+        return (1 - self.alpha) * direct_loss + self.alpha * env_loss
+    
+    def _compute_envelope(self, signal):
+        # Take absolute value
+        signal_abs = torch.abs(signal)
+        
+        # Apply smoothing with average pooling
+        # Pad first to maintain signal length
+        pad = self.window_size // 2
+        padded = F.pad(signal_abs, (pad, pad), mode='reflect')
+        
+        # Use average pooling for smoothing
+        envelope = F.avg_pool1d(
+            padded.unsqueeze(1),  # Add channel dim
+            kernel_size=self.window_size, 
+            stride=1,
+            padding=0
+        ).squeeze(1)  # Remove channel dim
+        
+        return envelope
+
+
+class MultiScaleLoss(nn.Module):
+    """Compares signals at multiple resolutions."""
+    def __init__(self, scales=[1, 2, 4, 8], weights=None):
+        super().__init__()
+        self.scales = scales
+        
+        # Default to equal weighting if not provided
+        if weights is None:
+            weights = [1.0/len(scales)] * len(scales)
+        else:
+            # Normalize weights
+            total = sum(weights)
+            weights = [w/total for w in weights]
+            
+        self.weights = weights
+        
+    def forward(self, pred, target):
+        total_loss = 0.0
+        
+        for scale, weight in zip(self.scales, self.weights):
+            if scale == 1:
+                # Original resolution
+                total_loss += weight * F.mse_loss(pred, target)
+            else:
+                # Downsampled resolution
+                pred_down = self._downsample(pred, scale)
+                target_down = self._downsample(target, scale)
+                total_loss += weight * F.mse_loss(pred_down, target_down)
+                
+        return total_loss
+    
+    def _downsample(self, signal, factor):
+        # Use average pooling for downsampling
+        return F.avg_pool1d(
+            signal.unsqueeze(1),  # Add channel dim
+            kernel_size=factor,
+            stride=factor,
+            padding=0
+        ).squeeze(1)  # Remove channel dim
+    
 class Signal2DTo1DModel(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
@@ -18,25 +99,31 @@ class Signal2DTo1DModel(pl.LightningModule):
         self.output_shape = config['model']['output_shape']
         self.encoder_filters = config['model']['encoder_filters']
         self.decoder_filters = config['model']['decoder_filters']
-        self.bottleneck_size = config['model']['bottleneck_size']
+        self.bottleneck_size = config['model']['bottleneck_size']  # Consider increasing this to 2048
         self.dropout_rate = config['model']['dropout_rate']
         self.lr = config['training']['learning_rate']
         self.weight_decay = config['training']['weight_decay']
         
-        # Build Encoder
-        self.encoder = nn.Sequential(
+        # Define encoder blocks to capture intermediate features for skip connections
+        self.enc1 = nn.Sequential(
             nn.Conv2d(1, self.encoder_filters[0], kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(self.encoder_filters[0]),
-            nn.LeakyReLU(0.2),
-            
+            nn.LeakyReLU(0.2)
+        )
+        
+        self.enc2 = nn.Sequential(
             nn.Conv2d(self.encoder_filters[0], self.encoder_filters[1], kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(self.encoder_filters[1]),
-            nn.LeakyReLU(0.2),
-            
+            nn.LeakyReLU(0.2)
+        )
+        
+        self.enc3 = nn.Sequential(
             nn.Conv2d(self.encoder_filters[1], self.encoder_filters[2], kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(self.encoder_filters[2]),
-            nn.LeakyReLU(0.2),
-            
+            nn.LeakyReLU(0.2)
+        )
+        
+        self.enc4 = nn.Sequential(
             nn.Conv2d(self.encoder_filters[2], self.encoder_filters[3], kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(self.encoder_filters[3]),
             nn.LeakyReLU(0.2)
@@ -45,7 +132,7 @@ class Signal2DTo1DModel(pl.LightningModule):
         # Calculate encoder output dimensions
         self.enc_output_dim = self._get_encoder_output_dim()
         
-        # Bottleneck
+        # Enhanced bottleneck
         self.bottleneck = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -54,79 +141,140 @@ class Signal2DTo1DModel(pl.LightningModule):
             nn.LeakyReLU(0.2)
         )
         
-        # Decoder
+        # Decoder input
         self.decoder_input = nn.Linear(self.bottleneck_size, 256)  # 16*16*1
         
-        # Transpose convolutions
-        self.decoder = nn.Sequential(
+        # Decoder blocks with skip connections
+        self.dec1 = nn.Sequential(
             nn.ConvTranspose2d(1, self.decoder_filters[0], kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(self.decoder_filters[0]),
-            nn.LeakyReLU(0.2),
-            
-            nn.ConvTranspose2d(self.decoder_filters[0], self.decoder_filters[1], kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2)
+        )
+        
+        self.dec2 = nn.Sequential(
+            nn.ConvTranspose2d(self.decoder_filters[0] + self.encoder_filters[3], 
+                              self.decoder_filters[1], kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(self.decoder_filters[1]),
-            nn.LeakyReLU(0.2),
-            
-            nn.ConvTranspose2d(self.decoder_filters[1], self.decoder_filters[2], kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2)
+        )
+        
+        self.dec3 = nn.Sequential(
+            nn.ConvTranspose2d(self.decoder_filters[1] + self.encoder_filters[2], 
+                              self.decoder_filters[2], kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(self.decoder_filters[2]),
-            nn.LeakyReLU(0.2),
-            
-            nn.ConvTranspose2d(self.decoder_filters[2], self.decoder_filters[3], kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2)
+        )
+        
+        self.dec4 = nn.Sequential(
+            nn.ConvTranspose2d(self.decoder_filters[2] + self.encoder_filters[1], 
+                              self.decoder_filters[3], kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(self.decoder_filters[3]),
             nn.LeakyReLU(0.2)
         )
         
-        # Calculate the flattened size after decoder
-        self.decoder_output_size = self._calculate_decoder_output_size()
+        # 1D CNN approach for final conversion
+        self.final_conv = nn.Sequential(
+            nn.AdaptiveAvgPool2d((32, 1)),  # Convert to shape suitable for 1D convs
+            nn.Flatten(2),  # Flatten spatial dims but keep batch and channel
+            nn.Conv1d(self.decoder_filters[3], 128, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(256, 512, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2)
+        )
         
-        # More efficient approach to produce final output
-        # Instead of a massive fully connected layer, we use a series of smaller ones
-        self.final_layers = nn.Sequential(
-            nn.AdaptiveAvgPool2d((16, 16)),  # Reduce spatial dimensions
+        # Final projection to output size
+        self.output_proj = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(16 * 16 * self.decoder_filters[3], 4096),
+            nn.Linear(512 * 32, 4096),
             nn.LeakyReLU(0.2),
             nn.Dropout(self.dropout_rate),
             nn.Linear(4096, self.output_shape[0])
         )
+        
+        # Custom loss
+         # Initialize loss functions
+        self.use_envelope_loss = config['training'].get('use_envelope_loss', True)
+        self.use_multiscale_loss = config['training'].get('use_multiscale_loss', True)
+        
+        # Loss weights (how much each loss contributes)
+        self.direct_loss_weight = config['training'].get('direct_loss_weight', 0.3)
+        self.envelope_loss_weight = config['training'].get('envelope_loss_weight', 0.4)
+        self.multiscale_loss_weight = config['training'].get('multiscale_loss_weight', 0.3)
+        
+        # Initialize losses
+        window_size = config['training'].get('envelope_window_size', 128)
+        self.envelope_loss = EnvelopeLoss(
+            alpha=0.5,  # Not used in combined mode
+            window_size=window_size
+        )
+        
+        scales = config['training'].get('multiscale_scales', [1, 2, 4, 8])
+        self.multiscale_loss = MultiScaleLoss(
+            scales=scales,
+            weights=None  # Equal weighting
+        )
+        
+        # For baseline comparison
+        self.mse_loss = nn.MSELoss()
     
     def _get_encoder_output_dim(self):
         # Helper method to calculate the encoder output dimension
         x = torch.zeros(1, 1, self.input_shape[0], self.input_shape[1])
-        x = self.encoder(x)
-        return x.shape
-    
-    def _calculate_decoder_output_size(self):
-        # Calculate the output size of the decoder
-        x = torch.zeros(1, 1, 16, 16)  # Starting size after reshaping
-        x = self.decoder(x)
-        return x.numel() // x.shape[0]  # Get the flattened size for one sample
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)
+        return e4.shape
     
     def forward(self, x):
         # Ensure input is correct shape (batch_size, channels, height, width)
         if len(x.shape) == 3:
             x = x.unsqueeze(1)  # Add channel dimension if missing
         
-        # Encoder
-        x = self.encoder(x)
+        # Encoder with intermediate features
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)
         
         # Bottleneck
-        x = self.bottleneck(x)
+        z = self.bottleneck(e4)
         
         # Decoder pre-processing
-        x = self.decoder_input(x)
-        x = x.view(-1, 1, 16, 16)  # Reshape for transpose convolutions
+        z = self.decoder_input(z)
+        z = z.view(-1, 1, 16, 16)  # Reshape for transpose convolutions
         
-        # Decoder
-        x = self.decoder(x)
+        # Decoder with skip connections
+        d1 = self.dec1(z)
         
-        # Final layers (adaptive pooling, flatten, and projection to output size)
-        x = self.final_layers(x)
+        # Use skip connections - need to handle different spatial dimensions
+        # We use adaptive pooling to ensure compatible dimensions
+        e4_resized = F.adaptive_avg_pool2d(e4, d1.shape[2:])
+        d1_skip = torch.cat([d1, e4_resized], dim=1)
+        
+        d2 = self.dec2(d1_skip)
+        e3_resized = F.adaptive_avg_pool2d(e3, d2.shape[2:])
+        d2_skip = torch.cat([d2, e3_resized], dim=1)
+        
+        d3 = self.dec3(d2_skip)
+        e2_resized = F.adaptive_avg_pool2d(e2, d3.shape[2:])
+        d3_skip = torch.cat([d3, e2_resized], dim=1)
+        
+        d4 = self.dec4(d3_skip)
+        
+        # 1D conversion
+        x = self.final_conv(d4)
+        
+        # Final projection to output
+        x = self.output_proj(x)
         
         return x
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
+        # Use AdamW instead of Adam for better weight decay behavior
+        optimizer = torch.optim.AdamW(
             self.parameters(), 
             lr=self.lr,
             weight_decay=self.weight_decay
@@ -152,34 +300,76 @@ class Signal2DTo1DModel(pl.LightningModule):
         else:
             return optimizer
     
+    def _compute_combined_loss(self, pred, target):
+        """Compute weighted combination of losses"""
+        loss_components = {}
+        
+        # Basic MSE loss (always computed for comparison)
+        direct_loss = self.mse_loss(pred, target)
+        loss_components['direct_loss'] = direct_loss
+        
+        # Initialize combined loss with direct loss component
+        combined_loss = self.direct_loss_weight * direct_loss
+        
+        # Add envelope loss if enabled
+        if self.use_envelope_loss:
+            # Disable autocast to avoid potential precision issues
+            with torch.cuda.amp.autocast(enabled=False):
+                env_loss = self.envelope_loss(pred.float(), target.float())
+            loss_components['envelope_loss'] = env_loss
+            combined_loss += self.envelope_loss_weight * env_loss
+            
+        # Add multiscale loss if enabled
+        if self.use_multiscale_loss:
+            # Disable autocast to avoid potential precision issues
+            with torch.cuda.amp.autocast(enabled=False):
+                ms_loss = self.multiscale_loss(pred.float(), target.float())
+            loss_components['multiscale_loss'] = ms_loss
+            combined_loss += self.multiscale_loss_weight * ms_loss
+            
+        # Store all loss components for logging
+        loss_components['combined_loss'] = combined_loss
+        
+        return combined_loss, loss_components
+    
     def training_step(self, batch, batch_idx):
         x, y = batch
         y_pred = self(x)
-        loss = F.mse_loss(y_pred, y)
         
-        # Log loss
+        # Compute combined loss
+        loss, loss_components = self._compute_combined_loss(y_pred, y)
+        
+        # Log all loss components
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True)
         
-        # Log visualizations every N steps
-        #if batch_idx % self.hparams['logging']['log_every_n_steps'] == 0:
-        #    self._log_predictions(x, y, y_pred, 'train')
+        # Log individual loss components
+        for name, value in loss_components.items():
+            if name != 'combined_loss':  # Already logged as train_loss
+                self.log(f'train_{name}', value, prog_bar=False, on_epoch=True)
         
         return loss
     
     def validation_step(self, batch, batch_idx):
         x, y = batch
         y_pred = self(x)
-        val_loss = F.mse_loss(y_pred, y)
         
-        # Log validation loss
-        self.log('val_loss', val_loss, prog_bar=True, on_epoch=True)
+        # Compute combined loss
+        loss, loss_components = self._compute_combined_loss(y_pred, y)
         
-        # Log visualizations
-        log_every = self.hparams['logging'].get('log_val_every_epoch', 1)  # Default to 1 if not set
-        if batch_idx == 0 and ( self.current_epoch % log_every == 0):
+        # Log all loss components
+        self.log('val_loss', loss, prog_bar=True, on_epoch=True)
+        
+        # Log individual loss components
+        for name, value in loss_components.items():
+            if name != 'combined_loss':  # Already logged as val_loss
+                self.log(f'val_{name}', value, prog_bar=False, on_epoch=True)
+        
+        # Maintain same visualization as original model
+        log_every = self.hparams['logging'].get('log_val_every_epoch', 1)
+        if batch_idx == 0 and (self.current_epoch % log_every == 0):
             self._log_predictions(x, y, y_pred, 'val')
         
-        return val_loss
+        return loss
     
     def _log_predictions(self, x, y, y_pred, prefix='train'):
         """Log visualizations to TensorBoard."""
