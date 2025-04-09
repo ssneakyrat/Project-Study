@@ -1,0 +1,4 @@
+kymatio #Wavelet scattering transforms in Python
+scikit-cuda
+cupy==13.0.0
+complextensor
