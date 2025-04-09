@@ -5,9 +5,26 @@ import torch
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import Callback
 
 from model import Signal2DTo1DModel
 from dataset import SignalDataModule
+
+# Custom callback to save checkpoints only at specific epoch intervals
+class EpochCheckpoint(Callback):
+    def __init__(self, dirpath, save_every_n_epochs):
+        super().__init__()
+        self.dirpath = dirpath
+        self.save_every_n_epochs = save_every_n_epochs
+        os.makedirs(dirpath, exist_ok=True)
+        
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+        if (epoch + 1) % self.save_every_n_epochs == 0:
+            checkpoint_path = os.path.join(self.dirpath, f"epoch_{epoch+1:04d}.ckpt")
+            trainer.save_checkpoint(checkpoint_path)
+            print(f"Saved checkpoint at epoch {epoch+1} to {checkpoint_path}")
+
 
 def main():
     # Parse command line arguments
@@ -48,15 +65,31 @@ def main():
     )
     
     # Set up callbacks
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=config['logging']['save_model_dir'],
-        filename='{epoch}-{val_loss:.4f}',
-        save_top_k=3,
-        monitor='val_loss',
-        mode='min'
-    )
+    callbacks = []
     
+    # Performance-based checkpointing (best models)
+    if config['logging'].get('save_best_models', True):
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=config['logging']['save_model_dir'],
+            filename='{epoch}-{val_loss:.4f}',
+            save_top_k=config['logging'].get('save_best_models_count', 3),
+            monitor='val_loss',
+            mode='min'
+        )
+        callbacks.append(checkpoint_callback)
+    
+    # Custom epoch-based checkpointing using our custom callback
+    if config['logging'].get('save_every_n_epochs', 0) > 0:
+        epoch_checkpoint_callback = EpochCheckpoint(
+            dirpath=config['logging']['save_model_dir'],
+            save_every_n_epochs=config['logging']['save_every_n_epochs']
+        )
+        callbacks.append(epoch_checkpoint_callback)
+
+    
+    # Learning rate monitor
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
+    callbacks.append(lr_monitor)
     
     # Configure trainer with mixed precision if enabled
     precision = '16-mixed' if config['training']['mixed_precision'] else 32
@@ -65,7 +98,7 @@ def main():
     trainer = Trainer(
         max_epochs=config['training']['epochs'],
         logger=logger,
-        callbacks=[checkpoint_callback, lr_monitor],
+        callbacks=callbacks,
         gradient_clip_val=config['training']['grad_clip_val'],
         accumulate_grad_batches=config['training']['grad_accumulation_steps'],
         precision=precision,
@@ -80,7 +113,10 @@ def main():
     else:
         trainer.fit(model, data_module)
     
-    print(f"Training complete! Best model saved at: {checkpoint_callback.best_model_path}")
+    if config['logging'].get('save_best_models', True):
+        print(f"Training complete! Best model saved at: {checkpoint_callback.best_model_path}")
+    else:
+        print("Training complete!")
 
 if __name__ == "__main__":
     main()

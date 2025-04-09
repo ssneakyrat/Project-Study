@@ -32,6 +32,9 @@ data:
 # Logging Configuration
 logging:
   log_every_n_steps: 10
-  log_val_every_epoch: 10  # Log validation predictions every 5 epochs
+  log_val_every_epoch: 10
   tensorboard_log_dir: "logs"
   save_model_dir: "logs/checkpoints"
+  save_every_n_epochs: 10  # Save checkpoint every 10 epochs
+  save_best_models: false  # Set to false to disable validation loss checkpoints
+  save_best_models_count: 3  # How many best models to save
