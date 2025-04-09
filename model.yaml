@@ -2,9 +2,9 @@
 model:
   input_shape: [862, 80]
   output_shape: [22050]
-  encoder_filters: [64, 128, 256, 512]
-  decoder_filters: [256, 128, 64, 32]
-  bottleneck_size: 2048
+  encoder_filters: [32, 64, 128, 256] #[64, 128, 256, 512]
+  decoder_filters: [128, 64, 32, 16] #[256, 128, 64, 32]
+  bottleneck_size: 512 #2048
   dropout_rate: 0.3
   
 # Training Configuration
@@ -46,4 +46,4 @@ logging:
   save_model_dir: "logs/checkpoints"
   save_every_n_epochs: 10
   save_best_models: true
-  save_best_models_count: 5
+  save_best_models_count: 2

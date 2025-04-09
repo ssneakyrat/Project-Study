@@ -74,17 +74,13 @@ def main():
             filename='{epoch}-{val_loss:.4f}',
             save_top_k=config['logging'].get('save_best_models_count', 3),
             monitor='val_loss',
-            mode='min'
+            mode='min',
+            save_weights_only=True,
+            save_last=False,
+            every_n_train_steps=None,
+            every_n_epochs=10
         )
         callbacks.append(checkpoint_callback)
-    
-    # Custom epoch-based checkpointing using our custom callback
-    if config['logging'].get('save_every_n_epochs', 0) > 0:
-        epoch_checkpoint_callback = EpochCheckpoint(
-            dirpath=config['logging']['save_model_dir'],
-            save_every_n_epochs=config['logging']['save_every_n_epochs']
-        )
-        callbacks.append(epoch_checkpoint_callback)
 
     
     # Learning rate monitor
