@@ -11,12 +11,14 @@ class AudioDataset(Dataset):
                  sample_rate=16000, 
                  sample_length=16000, 
                  use_conditioning=False,
-                 num_conditions=0):
+                 num_conditions=0,
+                 dataset_size=None):
         self.data_path = data_path
         self.sample_rate = sample_rate
         self.sample_length = sample_length
         self.use_conditioning = use_conditioning
         self.num_conditions = num_conditions
+        self.dataset_size = dataset_size
         
         # Get list of audio files
         self.files = self._get_files()
@@ -37,8 +39,8 @@ class AudioDataset(Dataset):
     
     def __len__(self):
         if len(self.files) == 0:
-            # Return dummy length for generated data
-            return 1000
+            # Return configured size or default for generated data
+            return self.dataset_size if self.dataset_size is not None else 1000
         return len(self.files)
     
     def __getitem__(self, idx):
@@ -90,6 +92,10 @@ class AudioDataModule(pl.LightningDataModule):
         self.val_path = config['data']['val_path']
         self.sample_rate = config['data']['sample_rate']
         
+        # Dataset size parameters
+        self.train_size = config['data'].get('train_size', None)
+        self.val_size = config['data'].get('val_size', None)
+        
         # Optional conditioning parameters
         self.use_conditioning = config.get('data', {}).get('use_conditioning', False)
         self.num_conditions = config.get('data', {}).get('num_conditions', 10)
@@ -101,7 +107,8 @@ class AudioDataModule(pl.LightningDataModule):
             sample_rate=self.sample_rate,
             sample_length=self.config['model']['input_size'],
             use_conditioning=self.use_conditioning,
-            num_conditions=self.num_conditions
+            num_conditions=self.num_conditions,
+            dataset_size=self.train_size
         )
         
         self.val_dataset = AudioDataset(
@@ -109,7 +116,8 @@ class AudioDataModule(pl.LightningDataModule):
             sample_rate=self.sample_rate,
             sample_length=self.config['model']['input_size'],
             use_conditioning=self.use_conditioning,
-            num_conditions=self.num_conditions
+            num_conditions=self.num_conditions,
+            dataset_size=self.val_size
         )
     
     def train_dataloader(self):

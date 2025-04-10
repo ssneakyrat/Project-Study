@@ -20,6 +20,8 @@ data:
   train_path: "data/train"
   val_path: "data/val"
   sample_rate: 16000
+  train_size: 1000  # Number of training samples
+  val_size: 200     # Number of validation samples
   
 # Logging
 logging:
