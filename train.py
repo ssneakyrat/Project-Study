@@ -1,83 +1,128 @@
-import torch
-import pytorch_lightning as pl
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
-from data_module import AudioDataModule
-from model import WSTVocoder
+import os
 import argparse
+import torch
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger
+
+from model import WaveletAEModel
+from data import AudioDataModule
 
 def main(args):
-    # Set up data module
+    """Main function to run training or testing"""
+    
+    # Create save directory
+    os.makedirs(args.save_dir, exist_ok=True)
+    
+    # Initialize data module
     data_module = AudioDataModule(
+        data_dir=args.data_dir,
         batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        num_samples=args.num_samples,
-        sample_length=args.sample_length,
-        sr=args.sample_rate
+        sample_rate=args.sample_rate,
+        segment_length=args.segment_length
     )
     
-    # Create model
-    model = WSTVocoder(
+    # Prepare data (generate test data if needed)
+    data_module.prepare_data()
+    data_module.setup()
+    
+    # Initialize model
+    model = WaveletAEModel(
+        segment_length=args.segment_length,
         sample_rate=args.sample_rate,
-        wst_J=args.wst_J,
-        wst_Q=args.wst_Q,
-        channels=args.channels,
-        latent_dim=args.latent_dim,
-        kernel_sizes=args.kernel_sizes,
-        strides=args.strides,
-        compression_factor=args.compression_factor,
+        encoder_dims=args.encoder_dims,
         learning_rate=args.learning_rate
     )
     
-    # Set up logger
-    logger = TensorBoardLogger("logs", name="wst_vocoder")
+    # Logger
+    logger = TensorBoardLogger(args.save_dir, name="wavelet_ae")
     
-    # Set up checkpoint callback
+    # Callbacks
     checkpoint_callback = ModelCheckpoint(
-        monitor="val_loss",
-        filename="wst_vocoder-{epoch:02d}-{val_loss:.2f}",
+        dirpath=os.path.join(logger.log_dir, "checkpoints"),
+        filename="wavelet_ae-{epoch:02d}-{val_loss:.4f}",
         save_top_k=3,
+        monitor="val_loss",
         mode="min"
     )
     
-    # Set up trainer
-    trainer = pl.Trainer(
-        max_epochs=args.max_epochs,
-        logger=logger,
-        callbacks=[checkpoint_callback],
-        accelerator="auto",  # Use GPU if available
-        devices=1,
-        gradient_clip_val=1.0,
-        precision=16 if args.use_amp else 32  # Use mixed precision if specified
+    early_stop_callback = EarlyStopping(
+        monitor="val_loss",
+        patience=args.patience,
+        mode="min"
     )
     
-    # Train
-    trainer.fit(model, data_module)
+    lr_monitor = LearningRateMonitor(logging_interval='epoch')
+    
+    # Trainer
+    trainer = Trainer(
+        max_epochs=args.max_epochs,
+        accelerator="gpu" if torch.cuda.is_available() and args.gpu else "cpu",
+        devices=1,
+        logger=logger,
+        callbacks=[checkpoint_callback, early_stop_callback, lr_monitor],
+        precision=16 if args.mixed_precision else 32,
+        gradient_clip_val=1.0,
+        log_every_n_steps=10
+    )
+    
+    if args.test_only:
+        # Run component tests
+        from test_components import test_component, test_data_module, test_wavelet_transform, \
+            test_complex_encoder, test_complex_decoder, test_full_model
+            
+        results = {}
+        results.update(test_component("DataModule", test_data_module))
+        results.update(test_component("WaveletTransform", test_wavelet_transform))
+        results.update(test_component("ComplexEncoder", test_complex_encoder))
+        results.update(test_component("ComplexDecoder", test_complex_decoder))
+        results.update(test_component("FullModel", test_full_model))
+        
+        # Print summary
+        print("\nTest Summary:")
+        for component, passed in results.items():
+            print(f"{component}: {'✓ PASS' if passed else '✗ FAIL'}")
+    else:
+        # Train the model
+        trainer.fit(model, data_module)
+    
+    return model, trainer
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Wavelet Audio Encoder-Decoder")
     
-    # Data args
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--num_samples", type=int, default=1000)
-    parser.add_argument("--sample_length", type=int, default=32000)  # 2 seconds at 16kHz
-    parser.add_argument("--sample_rate", type=int, default=16000)
+    # Data arguments
+    parser.add_argument("--data_dir", type=str, default=None, 
+                        help="Directory with audio files (if None, generates test data)")
+    parser.add_argument("--save_dir", type=str, default="results", 
+                        help="Directory to save results")
+    parser.add_argument("--batch_size", type=int, default=16, 
+                        help="Batch size")
+    parser.add_argument("--sample_rate", type=int, default=16000, 
+                        help="Audio sample rate")
+    parser.add_argument("--segment_length", type=int, default=16000, 
+                        help="Audio segment length (~1 second at 16kHz)")
     
-    # Model args
-    parser.add_argument("--wst_J", type=int, default=8)
-    parser.add_argument("--wst_Q", type=int, default=8)
-    parser.add_argument("--channels", type=int, nargs="+", default=[64, 128, 256])
-    parser.add_argument("--latent_dim", type=int, default=64)
-    parser.add_argument("--kernel_sizes", type=int, nargs="+", default=[5, 5, 5])
-    parser.add_argument("--strides", type=int, nargs="+", default=[2, 2, 2])
-    parser.add_argument("--compression_factor", type=int, default=16)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    # Model arguments
+    parser.add_argument("--encoder_dims", type=int, nargs="+", default=[64, 128, 256], 
+                        help="Encoder hidden dimensions")
     
-    # Training args
-    parser.add_argument("--max_epochs", type=int, default=100)
-    parser.add_argument("--use_amp", action="store_true", help="Use mixed precision training")
+    # Training arguments
+    parser.add_argument("--learning_rate", type=float, default=1e-4, 
+                        help="Learning rate")
+    parser.add_argument("--max_epochs", type=int, default=100, 
+                        help="Maximum epochs")
+    parser.add_argument("--patience", type=int, default=10, 
+                        help="Patience for early stopping")
+    parser.add_argument("--mixed_precision", action="store_true", 
+                        help="Use mixed precision training")
+    parser.add_argument("--gpu", action="store_true", 
+                        help="Use GPU for training")
+    
+    # Mode
+    parser.add_argument("--test_only", action="store_true", 
+                        help="Run component tests only")
     
     args = parser.parse_args()
     
-    main(args)
+    model, trainer = main(args)

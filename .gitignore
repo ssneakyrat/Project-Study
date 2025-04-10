@@ -9,3 +9,4 @@ inference_test.py
 docs/
 *.png
 *.h5
+tiny_dataset/
