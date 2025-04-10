@@ -4,7 +4,7 @@ from kymatio.torch import Scattering1D
 
 class WaveletScatteringTransform(nn.Module):
     def __init__(self, 
-                 J=8,  # Number of scales
+                 J=6,  # Reduced from 8 to 6 for better time resolution
                  Q=8,  # Number of wavelets per octave
                  T=16000,  # Signal length
                  max_order=2,  # Maximum scattering order
@@ -26,21 +26,30 @@ class WaveletScatteringTransform(nn.Module):
         self.max_order = max_order
         self.out_type = out_type
         
-        # Precompute coefficients count for each order
+        # Register normalization parameters as buffers
+        self.register_buffer('mean', torch.zeros(1))
+        self.register_buffer('std', torch.ones(1))
+        self.register_buffer('initialized', torch.tensor(0))
+        
+    def _update_normalization_stats(self, Sx):
+        """Update running statistics for better normalization"""
+        if not self.training:
+            return
+            
         with torch.no_grad():
-            dummy_input = torch.zeros(1, 1, T)
-            Sx = self.scattering(dummy_input)
-            if Sx.dim() == 4:
-                self.total_coeffs = Sx.shape[1] * Sx.shape[2]
+            # Update mean and std for more stable training
+            batch_mean = torch.mean(Sx)
+            batch_std = torch.std(Sx)
+            
+            if self.initialized == 0:
+                self.mean = batch_mean
+                self.std = batch_std
+                self.initialized = torch.tensor(1)
             else:
-                self.total_coeffs = Sx.shape[1]
-            
-            # Calculate normalization statistics for more stable training
-            random_input = torch.randn(16, 1, T)
-            random_sx = self.scattering(random_input)
-            
-            # Compute mean magnitude of coefficients for better normalization
-            self.scale_factor = torch.mean(torch.abs(random_sx)).item()
+                # Exponential moving average
+                momentum = 0.1
+                self.mean = (1 - momentum) * self.mean + momentum * batch_mean
+                self.std = (1 - momentum) * self.std + momentum * batch_std
         
     def forward(self, x):
         """
@@ -54,13 +63,17 @@ class WaveletScatteringTransform(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(1)
         
+        # Apply Hann window to reduce edge effects
+        window = torch.hann_window(self.T, device=x.device)
+        x = x * window.view(1, 1, -1)
+        
         # Pad or trim input if necessary to match expected length T
         _, _, L = x.shape
         if L != self.T:
             if L < self.T:
-                # Pad
+                # Pad with reflection padding to reduce boundary artifacts
                 pad_size = self.T - L
-                x = torch.nn.functional.pad(x, (0, pad_size))
+                x = torch.nn.functional.pad(x, (0, pad_size), mode='reflect')
             else:
                 # Trim
                 x = x[:, :, :self.T]
@@ -69,14 +82,15 @@ class WaveletScatteringTransform(nn.Module):
         Sx = self.scattering(x)
         
         # Reshape the output for the complex CNN
-        # Kymatio outputs [batch, order, coef, time] but we need [batch, channels, time]
         if Sx.dim() == 4:
             # Combine order and coef dimensions
             B, O, C, T = Sx.shape
             Sx = Sx.reshape(B, O * C, T)
         
-        # Apply proper normalization to preserve phase information
-        # Avoid the previous log1p transform which distorts phase
-        Sx = Sx / (self.scale_factor + 1e-8)
+        # Update normalization stats
+        self._update_normalization_stats(Sx)
         
-        return Sx
+        # Apply proper normalization
+        Sx_normalized = (Sx - self.mean) / (self.std + 1e-8)
+        
+        return Sx_normalized
