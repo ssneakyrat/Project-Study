@@ -9,7 +9,7 @@ from kymatio.torch import Scattering1D
 
 
 class WaveletScatteringTransform(nn.Module):
-    def __init__(self, J, Q, T, sample_rate, normalize=True, max_order=2):
+    def __init__(self, J, Q, T, sample_rate, normalize=True, max_order=2, ensure_output_dim=True):
         """
         Wavelet Scattering Transform module
         
@@ -20,6 +20,7 @@ class WaveletScatteringTransform(nn.Module):
             sample_rate (int): Audio sample rate
             normalize (bool): Whether to normalize the output
             max_order (int): Maximum scattering order (1 or 2)
+            ensure_output_dim (bool): Force output dimension consistency
         """
         super(WaveletScatteringTransform, self).__init__()
         
@@ -29,12 +30,16 @@ class WaveletScatteringTransform(nn.Module):
         self.sample_rate = sample_rate
         self.normalize = normalize
         self.max_order = max_order
+        self.ensure_output_dim = ensure_output_dim
         
         # Initialize Kymatio scattering transform
         self.scattering = Scattering1D(J=J, shape=T, Q=Q, max_order=max_order)
         
         # Register as buffer to move to correct device
         self.register_buffer('eps', torch.tensor(1e-8))
+        
+        # Calculate expected output shape for dimension consistency
+        self.expected_output_time_dim = T // (2**J)
         
     def forward(self, x):
         """
@@ -46,6 +51,9 @@ class WaveletScatteringTransform(nn.Module):
         Returns:
             Tuple of (real, imaginary) tensors representing complex scattering coefficients
         """
+        # Store original batch size
+        batch_size = x.size(0)
+        
         # Ensure x has correct shape [batch_size, 1, time]
         if x.dim() == 2:
             x = x.unsqueeze(1)
@@ -72,11 +80,6 @@ class WaveletScatteringTransform(nn.Module):
         
         # Kymatio's Scattering1D returns a real-valued tensor where coefficients are packed
         # We need to adapt to the expected complex format
-        batch_size = Sx.size(0)
-        
-        # Sx shape is [batch_size, C, T] where C includes both real and imaginary components
-        # We need to ensure we properly handle this output format
-        # The precise shape depends on the Kymatio version and configuration
         
         # Safer approach: just split the channels in half assuming they're interleaved
         # or stored sequentially (real components first, then imaginary)
@@ -92,8 +95,7 @@ class WaveletScatteringTransform(nn.Module):
             imag_part = Sx[:, C_half:, :]
         else:
             # 2. If real and imaginary parts are interleaved in the output
-            # Reshape to batch_size, C//2, 2, T_out where dim 2 separates real (0) and imag (1)
-            # This is a safer fallback assuming Kymatio returns complex data in a structured way
+            # Fallback to just using the output directly as real part
             real_part = Sx
             imag_part = torch.zeros_like(real_part)  # Default to zero imaginary part
         
@@ -104,7 +106,19 @@ class WaveletScatteringTransform(nn.Module):
             real_part = torch.log(magnitude + self.eps)
             imag_part = torch.zeros_like(real_part)  # Phase information is discarded in log normalization
         
-        # maintains mathematical validity while enabling correct forward propagation
+        # Ensure consistent output dimensions if flag is set
+        if self.ensure_output_dim and T_out != self.expected_output_time_dim:
+            if T_out > self.expected_output_time_dim:
+                # Trim output
+                real_part = real_part[:, :, :self.expected_output_time_dim]
+                imag_part = imag_part[:, :, :self.expected_output_time_dim]
+            else:
+                # Pad output
+                pad_size = self.expected_output_time_dim - T_out
+                real_part = F.pad(real_part, (0, pad_size))
+                imag_part = F.pad(imag_part, (0, pad_size))
+        
+        # Reshape if needed
         if real_part.dim() == 4:
             # Reshape from [B, C, H, W] → [B, C*H, W]
             batch_size, channels, height, width = real_part.shape
@@ -119,7 +133,7 @@ class ParametricWaveletTransform(nn.Module):
     A learnable version of wavelet scattering transform where filter parameters
     are learned during training
     """
-    def __init__(self, J, Q, T, sample_rate, init_from_scattering=True):
+    def __init__(self, J, Q, T, sample_rate, init_from_scattering=True, ensure_output_dim=True):
         """
         Initialize learnable wavelet transform
         
@@ -129,6 +143,7 @@ class ParametricWaveletTransform(nn.Module):
             T (int): Temporal support
             sample_rate (int): Audio sample rate
             init_from_scattering (bool): Whether to initialize from Kymatio
+            ensure_output_dim (bool): Force output dimension consistency
         """
         super(ParametricWaveletTransform, self).__init__()
         
@@ -136,6 +151,10 @@ class ParametricWaveletTransform(nn.Module):
         self.Q = Q 
         self.T = T
         self.sample_rate = sample_rate
+        self.ensure_output_dim = ensure_output_dim
+        
+        # Expected output time dimension
+        self.expected_output_time_dim = T // (2**J)
         
         # Number of filters = J*Q wavelets + 1 lowpass
         n_filters = J * Q + 1
@@ -184,8 +203,29 @@ class ParametricWaveletTransform(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(1)
         
+        # Ensure correct time dimension
+        if x.size(2) != self.T:
+            if x.size(2) < self.T:
+                # Pad
+                x = F.pad(x, (0, self.T - x.size(2)))
+            else:
+                # Truncate
+                x = x[:, :, :self.T]
+        
         # Apply filters
         output = self.conv(x)
+        
+        # Ensure consistent output dimensions if flag is set
+        if self.ensure_output_dim:
+            T_out = output.size(2)
+            if T_out != self.expected_output_time_dim:
+                if T_out > self.expected_output_time_dim:
+                    # Trim output
+                    output = output[:, :, :self.expected_output_time_dim]
+                else:
+                    # Pad output
+                    pad_size = self.expected_output_time_dim - T_out
+                    output = F.pad(output, (0, pad_size))
         
         # Split into real and imaginary (approximation)
         # In a real implementation, we would use Hilbert transform 

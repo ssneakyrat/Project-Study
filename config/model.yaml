@@ -14,16 +14,19 @@ data:
 
 # Wavelet Scattering Transform parameters
 wavelet:
-  J: 8  # Number of scales
+  J: 6  # Reduced from 8 for better temporal resolution
   Q: 8  # Number of wavelets per octave
   T: 8192  # Temporal support of the lowpass filter
+  ensure_output_dim: true  # New flag to enforce dimension matching
   
 # Model architecture
 model:
   latent_dim: 128
   channels: [32, 64, 128, 256]
-  kernel_sizes: [7, 5, 3, 3]
+  kernel_sizes: [5, 5, 5, 5]  # Symmetric kernels for better reconstruction
   strides: [2, 2, 2, 2]
+  paddings: [2, 2, 2, 2]  # Explicit padding control
+  output_paddings: [1, 1, 1, 1]  # For transposed convolutions
   dropout: 0.1
   use_batch_norm: true
   complex_repr: "rectangular"  # rectangular or polar

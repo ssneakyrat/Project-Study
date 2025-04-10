@@ -26,7 +26,8 @@ class SNR(nn.Module):
             Tensor: SNR value in dB
         """
         # Ensure input shapes match
-        assert pred.shape == target.shape, "Input shapes must match"
+        if pred.shape != target.shape:
+            raise ValueError(f"Input shapes must match: pred {pred.shape} vs target {target.shape}")
         
         # Calculate noise
         noise = target - pred
@@ -62,6 +63,10 @@ class PESQ(nn.Module):
         Returns:
             Tensor: PESQ score
         """
+        # Ensure input shapes match
+        if pred.shape != target.shape:
+            raise ValueError(f"Input shapes must match: pred {pred.shape} vs target {target.shape}")
+        
         # PESQ can only be computed on CPU with numpy arrays
         # In an actual implementation, this would use a PESQ estimator that works with PyTorch
         # For now, we'll use a placeholder implementation
@@ -105,6 +110,10 @@ class STOI(nn.Module):
         Returns:
             Tensor: STOI score
         """
+        # Ensure input shapes match
+        if pred.shape != target.shape:
+            raise ValueError(f"Input shapes must match: pred {pred.shape} vs target {target.shape}")
+        
         # STOI requires CPU computation with numpy arrays
         # In an actual implementation, we would use torchaudio's STOI
         # For now, we'll use a correlation-based approximation
@@ -145,6 +154,10 @@ class SpectralDistortion(nn.Module):
         Returns:
             Tensor: Spectral distortion measure
         """
+        # Ensure input shapes match
+        if pred.shape != target.shape:
+            raise ValueError(f"Input shapes must match: pred {pred.shape} vs target {target.shape}")
+        
         # Compute STFTs
         pred_stft = torch.stft(pred, n_fft=self.n_fft, hop_length=self.hop_length, 
                               window=torch.hann_window(self.n_fft).to(pred.device),
@@ -163,41 +176,6 @@ class SpectralDistortion(nn.Module):
         return spectral_distortion
 
 
-class WaveletDistortion(nn.Module):
-    """
-    Computes distortion in wavelet domain
-    """
-    def __init__(self, wavelet_transform):
-        super(WaveletDistortion, self).__init__()
-        self.wavelet_transform = wavelet_transform
-        
-    def forward(self, pred, target):
-        """
-        Args:
-            pred (Tensor): Predicted audio [B, T]
-            target (Tensor): Target audio [B, T]
-            
-        Returns:
-            Tensor: Wavelet domain distortion measure
-        """
-        # Apply wavelet transform
-        pred_wavelet = self.wavelet_transform(pred)
-        target_wavelet = self.wavelet_transform(target)
-        
-        # Unpack real and imaginary parts
-        pred_real, pred_imag = pred_wavelet
-        target_real, target_imag = target_wavelet
-        
-        # Compute distortion
-        real_distortion = F.mse_loss(pred_real, target_real, reduction='none').mean(dim=[1, 2])
-        imag_distortion = F.mse_loss(pred_imag, target_imag, reduction='none').mean(dim=[1, 2])
-        
-        # Combine real and imaginary distortions
-        total_distortion = real_distortion + imag_distortion
-        
-        return total_distortion
-
-
 def compute_metrics_dict(pred, target, sample_rate=16000):
     """
     Compute multiple audio quality metrics and return as dictionary
@@ -210,6 +188,18 @@ def compute_metrics_dict(pred, target, sample_rate=16000):
     Returns:
         dict: Dictionary of metrics
     """
+    # Ensure shapes match before computing metrics
+    if pred.shape != target.shape:
+        # Resize to match
+        if pred.dim() == target.dim():
+            # Match last dimension (time)
+            if pred.size(-1) > target.size(-1):
+                pred = pred[..., :target.size(-1)]
+            else:
+                # Pad with zeros
+                padding = target.size(-1) - pred.size(-1)
+                pred = F.pad(pred, (0, padding))
+    
     # Initialize metrics
     snr_metric = SNR()
     spectral_dist = SpectralDistortion()

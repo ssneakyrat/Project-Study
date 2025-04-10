@@ -8,7 +8,7 @@ from models.complex_layers import ComplexConv1d, ComplexBatchNorm1d, ComplexLeak
 
 
 class ComplexEncoder(nn.Module):
-    def __init__(self, input_channels, channels, kernel_sizes, strides, dropout=0.1, use_batch_norm=True):
+    def __init__(self, input_channels, channels, kernel_sizes, strides, paddings=None, dropout=0.1, use_batch_norm=True):
         """
         Complex-valued encoder network
         
@@ -17,6 +17,7 @@ class ComplexEncoder(nn.Module):
             channels (list): List of channel dimensions for each layer
             kernel_sizes (list): List of kernel sizes for each layer
             strides (list): List of strides for each layer
+            paddings (list, optional): List of padding values for each layer
             dropout (float): Dropout probability
             use_batch_norm (bool): Whether to use batch normalization
         """
@@ -24,6 +25,12 @@ class ComplexEncoder(nn.Module):
         
         # Ensure all lists have the same length
         assert len(channels) == len(kernel_sizes) == len(strides), "channels, kernel_sizes, and strides must have the same length"
+        
+        # Default paddings if not provided
+        if paddings is None:
+            paddings = [k // 2 for k in kernel_sizes]
+        else:
+            assert len(paddings) == len(channels), "paddings must have the same length as channels"
         
         self.num_layers = len(channels)
         self.layers = nn.ModuleList()
@@ -41,7 +48,7 @@ class ComplexEncoder(nn.Module):
                 out_channels=channels[i],
                 kernel_size=kernel_sizes[i],
                 stride=strides[i],
-                padding=kernel_sizes[i] // 2
+                padding=paddings[i]
             ))
             
             # Batch normalization
@@ -60,6 +67,14 @@ class ComplexEncoder(nn.Module):
             
             # Add layer to module list
             self.layers.append(nn.Sequential(*layer))
+        
+        # Store configuration for shape tracking
+        self.input_channels = input_channels
+        self.output_channels = channels[-1]
+        self.channels = channels
+        self.kernel_sizes = kernel_sizes
+        self.strides = strides
+        self.paddings = paddings
     
     def forward(self, x):
         """
@@ -76,112 +91,35 @@ class ComplexEncoder(nn.Module):
         intermediates = []
         
         # Pass through layers and store intermediates for skip connections
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            # Debug shape tracking (uncomment for debugging)
+            # if isinstance(x, tuple):
+            #     print(f"Encoder layer {i} input shape: {x[0].shape}")
+            # else:
+            #     print(f"Encoder layer {i} input shape: {x.shape}")
+            
             x = layer(x)
             intermediates.append(x)
+            
+            # Debug shape tracking (uncomment for debugging)
+            # if isinstance(x, tuple):
+            #     print(f"Encoder layer {i} output shape: {x[0].shape}")
+            # else:
+            #     print(f"Encoder layer {i} output shape: {x.shape}")
         
         return x, intermediates
-
-
-class DualPathEncoder(nn.Module):
-    """
-    Encoder with separate paths for magnitude and phase processing
-    """
-    def __init__(self, input_channels, channels, kernel_sizes, strides, dropout=0.1, use_batch_norm=True):
-        super(DualPathEncoder, self).__init__()
-        
-        # Magnitude path (real-valued)
-        self.mag_encoder = nn.ModuleList()
-        
-        # Phase path (real-valued but processes phase information)
-        self.phase_encoder = nn.ModuleList()
-        
-        # Input dimension
-        in_channels = input_channels
-        
-        # Create encoder layers
-        for i in range(len(channels)):
-            # Magnitude path
-            mag_layer = []
-            mag_layer.append(nn.Conv1d(
-                in_channels=in_channels,
-                out_channels=channels[i],
-                kernel_size=kernel_sizes[i],
-                stride=strides[i],
-                padding=kernel_sizes[i] // 2
-            ))
-            
-            if use_batch_norm:
-                mag_layer.append(nn.BatchNorm1d(channels[i]))
-            
-            mag_layer.append(nn.LeakyReLU(0.2))
-            
-            if dropout > 0:
-                mag_layer.append(nn.Dropout(dropout))
-            
-            self.mag_encoder.append(nn.Sequential(*mag_layer))
-            
-            # Phase path
-            phase_layer = []
-            phase_layer.append(nn.Conv1d(
-                in_channels=in_channels,
-                out_channels=channels[i],
-                kernel_size=kernel_sizes[i],
-                stride=strides[i],
-                padding=kernel_sizes[i] // 2
-            ))
-            
-            if use_batch_norm:
-                phase_layer.append(nn.BatchNorm1d(channels[i]))
-            
-            phase_layer.append(nn.LeakyReLU(0.2))
-            
-            if dropout > 0:
-                phase_layer.append(nn.Dropout(dropout))
-            
-            self.phase_encoder.append(nn.Sequential(*phase_layer))
-            
-            # Update input channels for next layer
-            in_channels = channels[i]
-    
-    def forward(self, x):
-        """
-        Forward pass
-        
-        Args:
-            x (tuple): Tuple of (magnitude, phase) tensors
-            
-        Returns:
-            tuple: Tuple of (encoded features, intermediates)
-        """
-        mag, phase = x
-        
-        mag_intermediates = []
-        phase_intermediates = []
-        
-        # Process magnitude path
-        for layer in self.mag_encoder:
-            mag = layer(mag)
-            mag_intermediates.append(mag)
-        
-        # Process phase path
-        for layer in self.phase_encoder:
-            phase = layer(phase)
-            phase_intermediates.append(phase)
-        
-        # Return encoded features and intermediates
-        encoded = (mag, phase)
-        intermediates = (mag_intermediates, phase_intermediates)
-        
-        return encoded, intermediates
 
 
 class ComplexResidualBlock(nn.Module):
     """
     Complex residual block for deeper encoders
     """
-    def __init__(self, channels, kernel_size=3, stride=1, dropout=0.1, use_batch_norm=True):
+    def __init__(self, channels, kernel_size=3, stride=1, padding=None, dropout=0.1, use_batch_norm=True):
         super(ComplexResidualBlock, self).__init__()
+        
+        # Default padding if not provided
+        if padding is None:
+            padding = kernel_size // 2
         
         # First complex convolution
         self.conv1 = ComplexConv1d(
@@ -189,7 +127,7 @@ class ComplexResidualBlock(nn.Module):
             out_channels=channels,
             kernel_size=kernel_size,
             stride=1,  # No striding in the residual block
-            padding=kernel_size // 2
+            padding=padding
         )
         
         # Batch norm and activation
@@ -202,7 +140,7 @@ class ComplexResidualBlock(nn.Module):
             out_channels=channels,
             kernel_size=kernel_size,
             stride=1,  # No striding in the residual block
-            padding=kernel_size // 2
+            padding=padding
         )
         
         # Batch norm
@@ -221,7 +159,7 @@ class ComplexResidualBlock(nn.Module):
                 out_channels=channels,
                 kernel_size=kernel_size,
                 stride=stride,
-                padding=kernel_size // 2
+                padding=padding
             )
         else:
             self.downsample = None

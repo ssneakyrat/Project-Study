@@ -8,7 +8,8 @@ from models.complex_layers import ComplexConvTranspose1d, ComplexBatchNorm1d, Co
 
 
 class ComplexDecoder(nn.Module):
-    def __init__(self, latent_channels, channels, kernel_sizes, strides, output_channels=1, dropout=0.1, use_batch_norm=True):
+    def __init__(self, latent_channels, channels, kernel_sizes, strides, paddings=None, output_paddings=None, 
+                output_channels=1, dropout=0.1, use_batch_norm=True):
         """
         Complex-valued decoder network with skip connections
         
@@ -17,6 +18,8 @@ class ComplexDecoder(nn.Module):
             channels (list): List of channel dimensions for each layer (in reverse order)
             kernel_sizes (list): List of kernel sizes for each layer (in reverse order)
             strides (list): List of strides for each layer (in reverse order)
+            paddings (list, optional): List of padding values for each layer
+            output_paddings (list, optional): List of output padding values for each layer
             output_channels (int): Number of output channels
             dropout (float): Dropout probability
             use_batch_norm (bool): Whether to use batch normalization
@@ -30,6 +33,19 @@ class ComplexDecoder(nn.Module):
         channels = channels[::-1]
         kernel_sizes = kernel_sizes[::-1]
         strides = strides[::-1]
+        
+        # Default paddings and output_paddings if not provided
+        if paddings is None:
+            paddings = [k // 2 for k in kernel_sizes]
+        else:
+            paddings = paddings[::-1]  # Reverse to match other parameters
+            assert len(paddings) == len(channels), "paddings must have the same length as channels"
+        
+        if output_paddings is None:
+            output_paddings = [s - 1 for s in strides]  # Default: stride - 1
+        else:
+            output_paddings = output_paddings[::-1]  # Reverse to match other parameters
+            assert len(output_paddings) == len(channels), "output_paddings must have the same length as channels"
         
         self.num_layers = len(channels)
         self.layers = nn.ModuleList()
@@ -50,8 +66,8 @@ class ComplexDecoder(nn.Module):
                 out_channels=out_channels,
                 kernel_size=kernel_sizes[i],
                 stride=strides[i],
-                padding=kernel_sizes[i] // 2,
-                output_padding=strides[i] - 1  # Needed to match output size
+                padding=paddings[i],
+                output_padding=output_paddings[i]
             ))
             
             # Batch normalization (except for the last layer)
@@ -73,6 +89,15 @@ class ComplexDecoder(nn.Module):
             
             # Add layer to module list
             self.layers.append(nn.Sequential(*layer))
+        
+        # Store configuration for shape tracking
+        self.latent_channels = latent_channels
+        self.output_channels = output_channels
+        self.channels = channels
+        self.kernel_sizes = kernel_sizes
+        self.strides = strides
+        self.paddings = paddings
+        self.output_paddings = output_paddings
     
     def forward(self, x, skip_connections=None):
         """
@@ -91,36 +116,49 @@ class ComplexDecoder(nn.Module):
         
         # Pass through layers with skip connections
         for i, layer in enumerate(self.layers):
+            # Debug shape tracking (uncomment for debugging)
+            # if isinstance(x, tuple):
+            #     print(f"Decoder layer {i} input shape: {x[0].shape}")
+            # else:
+            #     print(f"Decoder layer {i} input shape: {x.shape}")
+            
             # Apply layer
             x = layer(x)
             
+            # Debug shape tracking (uncomment for debugging)
+            # if isinstance(x, tuple):
+            #     print(f"Decoder layer {i} output shape: {x[0].shape}")
+            # else:
+            #     print(f"Decoder layer {i} output shape: {x.shape}")
+            
             # Add skip connection if available
-            if skip_connections is not None and i < len(skip_connections) - 1:  # Skip last connection to output
+            if skip_connections is not None and i < len(skip_connections):
                 skip = skip_connections[i]
                 
                 # Get real and imaginary parts
-                x_real, x_imag = x
-                skip_real, skip_imag = skip
-                
-                # Ensure skip connection channels match current layer
-                if x_real.shape[1] != skip_real.shape[1]:
-                    # Number of channels doesn't match - can't use this skip connection
-                    continue
+                if isinstance(x, tuple) and isinstance(skip, tuple):
+                    x_real, x_imag = x
+                    skip_real, skip_imag = skip
                     
-                # Resize skip connection if time dimensions don't match
-                if x_real.shape[2] != skip_real.shape[2]:
-                    try:
-                        # Try to interpolate to match dimensions
-                        skip_real = F.interpolate(skip_real, size=x_real.shape[2], mode='linear', align_corners=False)
-                        skip_imag = F.interpolate(skip_imag, size=x_imag.shape[2], mode='linear', align_corners=False)
-                    except RuntimeError:
-                        # If interpolation fails (e.g., for extreme size differences), skip this connection
+                    # Ensure skip connection channels match current layer
+                    if x_real.shape[1] != skip_real.shape[1]:
+                        # Number of channels doesn't match - can't use this skip connection
                         continue
-                
-                # Apply skip connection with dimensionality check
-                if x_real.shape == skip_real.shape and x_imag.shape == skip_imag.shape:
-                    alpha = 0.5  # Weighting factor for skip connection
-                    x = (x_real + alpha * skip_real, x_imag + alpha * skip_imag)
+                        
+                    # Resize skip connection if time dimensions don't match
+                    if x_real.shape[2] != skip_real.shape[2]:
+                        try:
+                            # Try to interpolate to match dimensions
+                            skip_real = F.interpolate(skip_real, size=x_real.shape[2], mode='linear', align_corners=False)
+                            skip_imag = F.interpolate(skip_imag, size=x_imag.shape[2], mode='linear', align_corners=False)
+                        except RuntimeError:
+                            # If interpolation fails (e.g., for extreme size differences), skip this connection
+                            continue
+                    
+                    # Apply skip connection with dimensionality check
+                    if x_real.shape == skip_real.shape and x_imag.shape == skip_imag.shape:
+                        alpha = 0.5  # Weighting factor for skip connection
+                        x = (x_real + alpha * skip_real, x_imag + alpha * skip_imag)
         
         return x
 
@@ -129,7 +167,7 @@ class ComplexUpsampleBlock(nn.Module):
     """
     Upsample block for complex-valued decoder
     """
-    def __init__(self, in_channels, out_channels, kernel_size=4, stride=2, dropout=0.1, use_batch_norm=True):
+    def __init__(self, in_channels, out_channels, kernel_size=4, stride=2, padding=1, output_padding=1, dropout=0.1, use_batch_norm=True):
         super(ComplexUpsampleBlock, self).__init__()
         
         # Complex transposed convolution for upsampling
@@ -138,8 +176,8 @@ class ComplexUpsampleBlock(nn.Module):
             out_channels=out_channels,
             kernel_size=kernel_size,
             stride=stride,
-            padding=kernel_size // 2 - 1,  # Adjusted for proper output size
-            output_padding=stride - 1
+            padding=padding,
+            output_padding=output_padding
         )
         
         # Batch normalization
@@ -187,138 +225,3 @@ class ComplexUpsampleBlock(nn.Module):
             x = (x_real + skip_real, x_imag + skip_imag)
         
         return x
-
-
-class DualPathDecoder(nn.Module):
-    """
-    Decoder with separate paths for magnitude and phase processing
-    to be used with DualPathEncoder
-    """
-    def __init__(self, latent_channels, channels, kernel_sizes, strides, output_channels=1, dropout=0.1, use_batch_norm=True):
-        super(DualPathDecoder, self).__init__()
-        
-        # Reverse the lists for decoder
-        channels = channels[::-1]
-        kernel_sizes = kernel_sizes[::-1]
-        strides = strides[::-1]
-        
-        # Magnitude path
-        self.mag_decoder = nn.ModuleList()
-        
-        # Phase path
-        self.phase_decoder = nn.ModuleList()
-        
-        # Input dimension
-        in_channels = latent_channels
-        
-        # Create decoder layers
-        for i in range(len(channels)):
-            # Set output channels
-            out_channels = channels[i] if i < len(channels) - 1 else output_channels
-            
-            # Magnitude path
-            mag_layer = []
-            mag_layer.append(nn.ConvTranspose1d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_sizes[i],
-                stride=strides[i],
-                padding=kernel_sizes[i] // 2,
-                output_padding=strides[i] - 1
-            ))
-            
-            if use_batch_norm and i < len(channels) - 1:
-                mag_layer.append(nn.BatchNorm1d(out_channels))
-            
-            if i == len(channels) - 1:
-                mag_layer.append(nn.Tanh())  # For output
-            else:
-                mag_layer.append(nn.LeakyReLU(0.2))
-            
-            if dropout > 0 and i < len(channels) - 1:
-                mag_layer.append(nn.Dropout(dropout))
-            
-            self.mag_decoder.append(nn.Sequential(*mag_layer))
-            
-            # Phase path
-            phase_layer = []
-            phase_layer.append(nn.ConvTranspose1d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_sizes[i],
-                stride=strides[i],
-                padding=kernel_sizes[i] // 2,
-                output_padding=strides[i] - 1
-            ))
-            
-            if use_batch_norm and i < len(channels) - 1:
-                phase_layer.append(nn.BatchNorm1d(out_channels))
-            
-            if i == len(channels) - 1:
-                # Phase should be between -π and π
-                phase_layer.append(nn.Tanh())  # Scale to [-1, 1], will multiply by π later
-            else:
-                phase_layer.append(nn.LeakyReLU(0.2))
-            
-            if dropout > 0 and i < len(channels) - 1:
-                phase_layer.append(nn.Dropout(dropout))
-            
-            self.phase_decoder.append(nn.Sequential(*phase_layer))
-            
-            # Update input channels for next layer
-            in_channels = out_channels
-    
-    def forward(self, x, skip_connections=None):
-        """
-        Forward pass
-        
-        Args:
-            x (tuple): Tuple of (magnitude, phase) encodings
-            skip_connections (tuple, optional): Tuple of (mag_skips, phase_skips) from encoder
-            
-        Returns:
-            tuple: Tuple of (magnitude, phase) outputs
-        """
-        mag, phase = x
-        
-        # Handle skip connections
-        mag_skips, phase_skips = None, None
-        if skip_connections is not None:
-            mag_skips, phase_skips = skip_connections
-            mag_skips = mag_skips[::-1]
-            phase_skips = phase_skips[::-1]
-        
-        # Process magnitude path
-        for i, layer in enumerate(self.mag_decoder):
-            mag = layer(mag)
-            
-            # Add skip connection if available
-            if mag_skips is not None and i < len(mag_skips) - 1:
-                skip = mag_skips[i]
-                
-                # Resize if needed
-                if mag.shape[2] != skip.shape[2]:
-                    skip = F.interpolate(skip, size=mag.shape[2], mode='linear', align_corners=False)
-                
-                # Add skip connection
-                mag = mag + 0.5 * skip
-        
-        # Process phase path
-        for i, layer in enumerate(self.phase_decoder):
-            phase = layer(phase)
-            
-            # Add skip connection if available
-            if phase_skips is not None and i < len(phase_skips) - 1:
-                skip = phase_skips[i]
-                
-                # Resize if needed
-                if phase.shape[2] != skip.shape[2]:
-                    skip = F.interpolate(skip, size=phase.shape[2], mode='linear', align_corners=False)
-                
-                # Add skip connection with circular mean for phase
-                phase = phase + 0.5 * skip
-        
-        # For the phase output, scale to [-π, π]
-        phase = phase * torch.pi
-        
-        return mag, phase

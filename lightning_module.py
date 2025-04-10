@@ -37,7 +37,8 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
             Q=config['wavelet']['Q'],
             T=config['wavelet']['T'],
             sample_rate=config['data']['sample_rate'],
-            normalize=True
+            normalize=True,
+            ensure_output_dim=config['wavelet'].get('ensure_output_dim', True)
         )
         
         # Get the number of input channels from WST
@@ -58,22 +59,32 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
             J, Q = config['wavelet']['J'], config['wavelet']['Q']
             input_channels = J * Q  # Conservative estimate
         
+        # Extract model parameters from config
+        channels = config['model']['channels']
+        kernel_sizes = config['model']['kernel_sizes']
+        strides = config['model']['strides']
+        paddings = config['model'].get('paddings', None)
+        output_paddings = config['model'].get('output_paddings', None)
+        
         # Initialize encoder
         self.encoder = ComplexEncoder(
             input_channels=input_channels,
-            channels=config['model']['channels'],
-            kernel_sizes=config['model']['kernel_sizes'],
-            strides=config['model']['strides'],
+            channels=channels,
+            kernel_sizes=kernel_sizes,
+            strides=strides,
+            paddings=paddings,
             dropout=config['model']['dropout'],
             use_batch_norm=config['model']['use_batch_norm']
         )
         
         # Initialize decoder
         self.decoder = ComplexDecoder(
-            latent_channels=config['model']['channels'][-1],
-            channels=config['model']['channels'],
-            kernel_sizes=config['model']['kernel_sizes'],
-            strides=config['model']['strides'],
+            latent_channels=channels[-1],
+            channels=channels,
+            kernel_sizes=kernel_sizes,
+            strides=strides,
+            paddings=paddings,
+            output_paddings=output_paddings,
             output_channels=1,  # Single channel audio output
             dropout=config['model']['dropout'],
             use_batch_norm=config['model']['use_batch_norm']
@@ -139,6 +150,13 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         
         # Convert complex output to real
         output = self.to_real(decoded)
+        
+        # Debug shapes (uncomment for debugging)
+        # print(f"Input shape: {x.shape}")
+        # print(f"WST output shape: {wst_output[0].shape if isinstance(wst_output, tuple) else wst_output.shape}")
+        # print(f"Encoded shape: {encoded[0].shape if isinstance(encoded, tuple) else encoded.shape}")
+        # print(f"Decoded shape: {decoded[0].shape if isinstance(decoded, tuple) else decoded.shape}")
+        # print(f"Output shape: {output.shape}")
         
         # Ensure output has the same length as the original input
         if output.size(-1) != original_length:
@@ -239,6 +257,13 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         x = batch
         x_hat = self(x)
         
+        # Ensure shapes match for metrics calculation
+        if x_hat.shape != x.shape:
+            if x_hat.size(-1) > x.size(-1):
+                x_hat = x_hat[..., :x.size(-1)]
+            else:
+                x_hat = F.pad(x_hat, (0, x.size(-1) - x_hat.size(-1)))
+        
         # Compute losses (same as training)
         l1_loss = F.l1_loss(x_hat, x)
         complex_loss, mag_loss, phase_loss = self.stft_loss(x_hat, x)
@@ -297,6 +322,13 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         # Forward pass
         x = batch
         x_hat = self(x)
+        
+        # Ensure shapes match for metrics calculation
+        if x_hat.shape != x.shape:
+            if x_hat.size(-1) > x.size(-1):
+                x_hat = x_hat[..., :x.size(-1)]
+            else:
+                x_hat = F.pad(x_hat, (0, x.size(-1) - x_hat.size(-1)))
         
         # Compute metrics
         metrics = compute_metrics_dict(x_hat, x, sample_rate=self.config['data']['sample_rate'])

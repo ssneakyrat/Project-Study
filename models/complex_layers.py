@@ -29,6 +29,14 @@ class ComplexConv1d(nn.Module):
         self.conv_re = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias)
         self.conv_im = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias)
         
+        # Save configuration for reference
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        
     def forward(self, x):
         """
         Forward pass
@@ -76,6 +84,15 @@ class ComplexConvTranspose1d(nn.Module):
         self.deconv_re = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride, padding, output_padding, groups, bias, dilation)
         self.deconv_im = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride, padding, output_padding, groups, bias, dilation)
         
+        # Save configuration for reference
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.dilation = dilation
+
     def forward(self, x):
         """
         Forward pass
