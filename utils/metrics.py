@@ -1,3 +1,5 @@
+# Complete fix for utils/metrics.py
+
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
@@ -19,15 +21,21 @@ class SNR(nn.Module):
     def forward(self, pred, target):
         """
         Args:
-            pred (Tensor): Predicted audio [B, T]
-            target (Tensor): Target audio [B, T]
+            pred (Tensor): Predicted audio [B, T] or [B, C, T]
+            target (Tensor): Target audio [B, T] or [B, C, T]
             
         Returns:
             Tensor: SNR value in dB
         """
-        # Ensure input shapes match
+        # Handle dimension mismatch
+        if pred.dim() == 3 and target.dim() == 2:
+            pred = pred.squeeze(1)  # Remove channel dimension
+        elif pred.dim() == 2 and target.dim() == 3:
+            target = target.squeeze(1)
+            
+        # Ensure input shapes match after adjustment
         if pred.shape != target.shape:
-            raise ValueError(f"Input shapes must match: pred {pred.shape} vs target {target.shape}")
+            raise ValueError(f"Input shapes must match after dimension adjustment: pred {pred.shape} vs target {target.shape}")
         
         # Calculate noise
         noise = target - pred
@@ -52,20 +60,24 @@ class PESQ(nn.Module):
         self.sample_rate = sample_rate
         self.mode = mode  # 'nb' for narrowband or 'wb' for wideband
         
-        # PESQ requires to detach tensors and move to CPU as numpy arrays
-        
     def forward(self, pred, target):
         """
         Args:
-            pred (Tensor): Predicted audio [B, T]
-            target (Tensor): Target audio [B, T]
+            pred (Tensor): Predicted audio [B, T] or [B, C, T]
+            target (Tensor): Target audio [B, T] or [B, C, T]
             
         Returns:
             Tensor: PESQ score
         """
-        # Ensure input shapes match
+        # Handle dimension mismatch
+        if pred.dim() == 3 and target.dim() == 2:
+            pred = pred.squeeze(1)
+        elif pred.dim() == 2 and target.dim() == 3:
+            target = target.squeeze(1)
+            
+        # Ensure input shapes match after adjustment
         if pred.shape != target.shape:
-            raise ValueError(f"Input shapes must match: pred {pred.shape} vs target {target.shape}")
+            raise ValueError(f"Input shapes must match after dimension adjustment: pred {pred.shape} vs target {target.shape}")
         
         # PESQ can only be computed on CPU with numpy arrays
         # In an actual implementation, this would use a PESQ estimator that works with PyTorch
@@ -104,19 +116,21 @@ class STOI(nn.Module):
     def forward(self, pred, target):
         """
         Args:
-            pred (Tensor): Predicted audio [B, T]
-            target (Tensor): Target audio [B, T]
+            pred (Tensor): Predicted audio [B, T] or [B, C, T]
+            target (Tensor): Target audio [B, T] or [B, C, T]
             
         Returns:
             Tensor: STOI score
         """
-        # Ensure input shapes match
+        # Handle dimension mismatch
+        if pred.dim() == 3 and target.dim() == 2:
+            pred = pred.squeeze(1)
+        elif pred.dim() == 2 and target.dim() == 3:
+            target = target.squeeze(1)
+            
+        # Ensure input shapes match after adjustment
         if pred.shape != target.shape:
-            raise ValueError(f"Input shapes must match: pred {pred.shape} vs target {target.shape}")
-        
-        # STOI requires CPU computation with numpy arrays
-        # In an actual implementation, we would use torchaudio's STOI
-        # For now, we'll use a correlation-based approximation
+            raise ValueError(f"Input shapes must match after dimension adjustment: pred {pred.shape} vs target {target.shape}")
         
         batch_size = pred.shape[0]
         scores = []
@@ -148,15 +162,21 @@ class SpectralDistortion(nn.Module):
     def forward(self, pred, target):
         """
         Args:
-            pred (Tensor): Predicted audio [B, T]
-            target (Tensor): Target audio [B, T]
+            pred (Tensor): Predicted audio [B, T] or [B, C, T]
+            target (Tensor): Target audio [B, T] or [B, C, T]
             
         Returns:
             Tensor: Spectral distortion measure
         """
-        # Ensure input shapes match
+        # Handle dimension mismatch
+        if pred.dim() == 3 and target.dim() == 2:
+            pred = pred.squeeze(1)
+        elif pred.dim() == 2 and target.dim() == 3:
+            target = target.squeeze(1)
+            
+        # Ensure input shapes match after adjustment
         if pred.shape != target.shape:
-            raise ValueError(f"Input shapes must match: pred {pred.shape} vs target {target.shape}")
+            raise ValueError(f"Input shapes must match after dimension adjustment: pred {pred.shape} vs target {target.shape}")
         
         # Compute STFTs
         pred_stft = torch.stft(pred, n_fft=self.n_fft, hop_length=self.hop_length, 
@@ -181,13 +201,19 @@ def compute_metrics_dict(pred, target, sample_rate=16000):
     Compute multiple audio quality metrics and return as dictionary
     
     Args:
-        pred (Tensor): Predicted audio [B, T]
-        target (Tensor): Target audio [B, T]
+        pred (Tensor): Predicted audio [B, T] or [B, C, T]
+        target (Tensor): Target audio [B, T] or [B, C, T]
         sample_rate (int): Audio sample rate
         
     Returns:
         dict: Dictionary of metrics
     """
+    # Handle dimension mismatch
+    if pred.dim() == 3 and target.dim() == 2:
+        pred = pred.squeeze(1)
+    elif pred.dim() == 2 and target.dim() == 3:
+        target = target.squeeze(1)
+    
     # Ensure shapes match before computing metrics
     if pred.shape != target.shape:
         # Resize to match

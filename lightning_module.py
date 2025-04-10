@@ -126,6 +126,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         # Store original shape for output reshaping
         batch_size = x.size(0)
         original_length = x.size(-1)
+        original_dim = x.dim()  # Store original dimensionality
         
         # Ensure the input has the right length for wavelet transform
         target_length = self.config['wavelet']['T']
@@ -151,13 +152,6 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         # Convert complex output to real
         output = self.to_real(decoded)
         
-        # Debug shapes (uncomment for debugging)
-        # print(f"Input shape: {x.shape}")
-        # print(f"WST output shape: {wst_output[0].shape if isinstance(wst_output, tuple) else wst_output.shape}")
-        # print(f"Encoded shape: {encoded[0].shape if isinstance(encoded, tuple) else encoded.shape}")
-        # print(f"Decoded shape: {decoded[0].shape if isinstance(decoded, tuple) else decoded.shape}")
-        # print(f"Output shape: {output.shape}")
-        
         # Ensure output has the same length as the original input
         if output.size(-1) != original_length:
             if output.size(-1) > original_length:
@@ -167,6 +161,11 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
                 # Pad
                 padding = original_length - output.size(-1)
                 output = F.pad(output, (0, padding))
+        
+        # Match original dimensionality
+        if output.dim() != original_dim:
+            if original_dim == 2 and output.dim() == 3:
+                output = output.squeeze(1)
         
         return output
     
@@ -257,6 +256,13 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         x = batch
         x_hat = self(x)
         
+        # Ensure shape matching for metrics calculation
+        if x_hat.dim() != x.dim():
+            if x_hat.dim() == 3 and x.dim() == 2:
+                x_hat = x_hat.squeeze(1)
+            elif x_hat.dim() == 2 and x.dim() == 3:
+                x_hat = x_hat.unsqueeze(1)
+        
         # Ensure shapes match for metrics calculation
         if x_hat.shape != x.shape:
             if x_hat.size(-1) > x.size(-1):
@@ -322,6 +328,13 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         # Forward pass
         x = batch
         x_hat = self(x)
+        
+        # Ensure shape matching for metrics calculation
+        if x_hat.dim() != x.dim():
+            if x_hat.dim() == 3 and x.dim() == 2:
+                x_hat = x_hat.squeeze(1)
+            elif x_hat.dim() == 2 and x.dim() == 3:
+                x_hat = x_hat.unsqueeze(1)
         
         # Ensure shapes match for metrics calculation
         if x_hat.shape != x.shape:
