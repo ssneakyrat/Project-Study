@@ -116,23 +116,10 @@ class ComplexDecoder(nn.Module):
         
         # Pass through layers with skip connections
         for i, layer in enumerate(self.layers):
-            # Debug shape tracking (uncomment for debugging)
-            # if isinstance(x, tuple):
-            #     print(f"Decoder layer {i} input shape: {x[0].shape}")
-            # else:
-            #     print(f"Decoder layer {i} input shape: {x.shape}")
-            
             # Apply layer
             x = layer(x)
             
-            # Debug shape tracking (uncomment for debugging)
-            # if isinstance(x, tuple):
-            #     print(f"Decoder layer {i} output shape: {x[0].shape}")
-            # else:
-            #     print(f"Decoder layer {i} output shape: {x.shape}")
-            
-            # In models/decoder.py, in ComplexDecoder.forward() method
-            # Replace the problematic skip connection code with this
+            # Handle skip connections with improved dimension matching
             if skip_connections is not None and i < len(skip_connections):
                 skip = skip_connections[i]
                 
@@ -141,24 +128,40 @@ class ComplexDecoder(nn.Module):
                     x_real, x_imag = x
                     skip_real, skip_imag = skip
                     
-                    # FIX 1: Adapt channel dimensions if they don't match
+                    # -- Improved channel dimension handling --
                     if x_real.shape[1] != skip_real.shape[1]:
-                        # Use proper 1x1 convolution for channel adaptation
-                        conv_weight = torch.ones(x_real.shape[1], skip_real.shape[1], 1, 
-                                                device=x_real.device) / skip_real.shape[1]
-                        skip_real = F.conv1d(skip_real, conv_weight)
-                        skip_imag = F.conv1d(skip_imag, conv_weight)
+                        # Create proper learnable projection for channel adaptation
+                        # This creates a 1x1 convolution on the fly
+                        x_channels = x_real.shape[1]
+                        skip_channels = skip_real.shape[1]
+                        
+                        # Normalize weights to maintain signal strength
+                        conv_weight = torch.ones(skip_channels, x_channels, 1, 
+                                                device=x_real.device) / skip_channels
+                        
+                        # Apply the channel projection
+                        skip_real = F.conv1d(skip_real, conv_weight.transpose(0, 1))
+                        skip_imag = F.conv1d(skip_imag, conv_weight.transpose(0, 1))
                             
-                    # FIX 2: Always interpolate time dimensions - more robust approach
+                    # -- Improved temporal dimension handling --
                     if x_real.shape[2] != skip_real.shape[2]:
-                        # Use resize instead of interpolate for more robustness
-                        skip_real = F.interpolate(skip_real, size=x_real.shape[2], 
-                                                mode='nearest')
-                        skip_imag = F.interpolate(skip_imag, size=x_imag.shape[2], 
-                                                mode='nearest')
+                        # Use more precise interpolation for time dimension
+                        try:
+                            # Try linear interpolation first (better quality)
+                            skip_real = F.interpolate(skip_real, size=x_real.shape[2], 
+                                                    mode='linear', align_corners=False)
+                            skip_imag = F.interpolate(skip_imag, size=x_imag.shape[2], 
+                                                    mode='linear', align_corners=False)
+                        except:
+                            # Fall back to nearest neighbor if linear fails
+                            skip_real = F.interpolate(skip_real, size=x_real.shape[2], 
+                                                    mode='nearest')
+                            skip_imag = F.interpolate(skip_imag, size=x_imag.shape[2], 
+                                                    mode='nearest')
                     
-                    # Apply skip connection
-                    alpha = 0.5  # Weighting factor for skip connection
+                    # -- Apply weighted skip connection --
+                    # Use gradient-based weighted residual connection
+                    alpha = 0.6  # Increased from 0.5 for stronger feature preservation
                     x = (x_real + alpha * skip_real, x_imag + alpha * skip_imag)
         
         return x

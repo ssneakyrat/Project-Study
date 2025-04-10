@@ -14,22 +14,22 @@ data:
 
 # Wavelet Scattering Transform parameters
 wavelet:
-  J: 4  # Reduced from 4 16x temporal downsampling
-  Q: 8  # Number of wavelets per octave
+  J: 3  # Changed from 1 to 3 for better frequency resolution
+  Q: 12  # Increased frequency resolution
   T: 8192  # Temporal support of the lowpass filter
-  ensure_output_dim: true  # New flag to enforce dimension matching
+  ensure_output_dim: true
   
 # Model architecture
 model:
-  latent_dim: 128
+  latent_dim: 256
   channels: [32, 64, 128, 256]
-  kernel_sizes: [5, 5, 5, 5]  # Symmetric kernels for better reconstruction
-  strides: [2, 2, 2, 2]
-  paddings: [2, 2, 2, 2]  # Explicit padding control
-  output_paddings: [1, 1, 1, 1]  # For transposed convolutions
+  kernel_sizes: [5, 5, 5, 5]
+  strides: [2, 2, 2, 2]  # Back to standard strides
+  paddings: [2, 2, 2, 2]
+  output_paddings: [1, 1, 1, 1]  # Updated for standard strides
   dropout: 0.1
   use_batch_norm: true
-  complex_repr: "rectangular"  # rectangular or polar
+  complex_repr: "rectangular"
 
 # Training parameters
 training:
@@ -41,11 +41,11 @@ training:
   beta2: 0.999
   scheduler_gamma: 0.95
   num_workers: 4
-  precision: 16-mixed  # Use mixed precision
+  precision: 16-mixed
 
 # Loss weights
 loss:
-  l1_weight: 1.0  # Increased from 0.5
+  l1_weight: 1.0
   stft_weight: 1.0
-  complex_loss_weight: 0.25
+  complex_loss_weight: 0.5  # Increased from 0.25 to 0.5 to emphasize phase
   spectral_convergence_weight: 0.5

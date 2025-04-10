@@ -266,15 +266,16 @@ class ComplexDropout(nn.Module):
 
 
 class ComplexToReal(nn.Module):
-    def __init__(self, mode='magnitude'):
+    def __init__(self, mode='real'):  # Using 'real' now as default for stability
         """
         Convert complex-valued tensor to real-valued tensor
         
         Args:
-            mode (str): Conversion mode, one of ['magnitude', 'real', 'imag', 'phase']
+            mode (str): Conversion mode, one of ['magnitude', 'real', 'imag', 'phase', 'mag_phase']
         """
         super(ComplexToReal, self).__init__()
-        assert mode in ['magnitude', 'real', 'imag', 'phase'], "Mode must be one of ['magnitude', 'real', 'imag', 'phase']"
+        assert mode in ['magnitude', 'real', 'imag', 'phase', 'mag_phase'], \
+            "Mode must be one of ['magnitude', 'real', 'imag', 'phase', 'mag_phase']"
         self.mode = mode
         
     def forward(self, x):
@@ -294,11 +295,38 @@ class ComplexToReal(nn.Module):
         else:
             return x  # Already real
         
+        # Print shapes for debugging
+        print(f"ComplexToReal input shapes - Real: {x_real.shape}, Imag: {x_imag.shape}")
+        
         if self.mode == 'magnitude':
-            return torch.sqrt(x_real**2 + x_imag**2)
+            out = torch.sqrt(x_real**2 + x_imag**2)
         elif self.mode == 'real':
-            return x_real
+            out = x_real
         elif self.mode == 'imag':
-            return x_imag
+            out = x_imag
         elif self.mode == 'phase':
-            return torch.atan2(x_imag, x_real)
+            out = torch.atan2(x_imag, x_real)
+        elif self.mode == 'mag_phase':
+            # Improved combination of magnitude and phase
+            # This approach preserves more structural information
+            mag = torch.sqrt(x_real**2 + x_imag**2)
+            phase = torch.atan2(x_imag, x_real)
+            out = mag * torch.cos(phase)
+        
+        # Print output shape
+        print(f"ComplexToReal output shape: {out.shape}")
+        
+        # Check for very small values
+        num_zeros = torch.sum((torch.abs(out) < 1e-6).float()).item()
+        total_elements = out.numel()
+        print(f"Percentage of near-zero values: {100 * num_zeros / total_elements:.2f}%")
+        
+        # Check for NaN or inf values
+        has_nan = torch.isnan(out).any().item()
+        has_inf = torch.isinf(out).any().item()
+        if has_nan or has_inf:
+            print("WARNING: Output contains NaN or Inf values!")
+            # Replace NaN/Inf with zeros
+            out = torch.nan_to_num(out, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        return out

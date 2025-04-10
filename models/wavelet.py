@@ -47,7 +47,7 @@ class WaveletScatteringTransform(nn.Module):
         
         Args:
             x (Tensor): Input audio of shape [batch_size, time] or [batch_size, 1, time]
-            
+                
         Returns:
             Tuple of (real, imaginary) tensors representing complex scattering coefficients
         """
@@ -78,18 +78,14 @@ class WaveletScatteringTransform(nn.Module):
         x = x.contiguous()  # Ensure tensor is memory-contiguous
         Sx = self.scattering(x)
         
-        # Kymatio's Scattering1D returns a real-valued tensor where coefficients are packed
-        # We need to adapt to the expected complex format
-        
-        # Safer approach: just split the channels in half assuming they're interleaved
-        # or stored sequentially (real components first, then imaginary)
-        C = Sx.size(1)
-        T_out = Sx.size(2)
+        # Print dimensions for debugging
+        print(f"Raw scattering output shape: {Sx.shape}")
         
         # Two approaches depending on how Kymatio packs the data:
         # 1. If real and imaginary parts are in separate channels
         if hasattr(self.scattering, 'output_format') and self.scattering.output_format == 'array':
             # Split channels evenly (assuming first half are real, second half imaginary)
+            C = Sx.size(1)
             C_half = C // 2
             real_part = Sx[:, :C_half, :]
             imag_part = Sx[:, C_half:, :]
@@ -99,34 +95,30 @@ class WaveletScatteringTransform(nn.Module):
             real_part = Sx
             imag_part = torch.zeros_like(real_part)  # Default to zero imaginary part
         
-        # Normalize if required
+        # Normalize if required, but preserve structure better
         if self.normalize:
-            # Log normalization to reduce dynamic range
+            # Improved normalization that preserves signal structure
             magnitude = torch.sqrt(real_part**2 + imag_part**2 + self.eps)
-            real_part = torch.log(magnitude + self.eps)
-            imag_part = torch.zeros_like(real_part)  # Phase information is discarded in log normalization
+            mean_magnitude = torch.mean(magnitude)
+            # Scale magnitude to reasonable range without log
+            real_part = real_part / (mean_magnitude + self.eps) * 0.1
+            imag_part = imag_part / (mean_magnitude + self.eps) * 0.1
         
-        # Ensure consistent output dimensions if flag is set
-        if self.ensure_output_dim and T_out != self.expected_output_time_dim:
-            if T_out > self.expected_output_time_dim:
-                # Trim output
-                real_part = real_part[:, :, :self.expected_output_time_dim]
-                imag_part = imag_part[:, :, :self.expected_output_time_dim]
-            else:
-                # Pad output
-                pad_size = self.expected_output_time_dim - T_out
-                real_part = F.pad(real_part, (0, pad_size))
-                imag_part = F.pad(imag_part, (0, pad_size))
+        # Check the shape for debugging
+        print(f"After normalization - Real: {real_part.shape}, Imag: {imag_part.shape}")
         
-        # Reshape if needed
-        if real_part.dim() == 4:
-            # Reshape from [B, C, H, W] → [B, C*H, W]
-            batch_size, channels, height, width = real_part.shape
-            real_part = real_part.reshape(batch_size, channels*height, width)
-            imag_part = imag_part.reshape(batch_size, channels*height, width)
-
+        # FIX FOR DIMENSIONAL ROTATION
+        # Check if time dimension is larger than channel dimension
+        if real_part.size(1) < real_part.size(2):
+            print(f"Applying dimension transpose: {real_part.shape} -> ", end="")
+            real_part = real_part.transpose(1, 2)
+            imag_part = imag_part.transpose(1, 2)
+            print(f"{real_part.shape}")
+        
+        # Print final shape for debugging
+        print(f"Final WST output - Real: {real_part.shape}, Imag: {imag_part.shape}")
+        
         return (real_part, imag_part)
-
 
 class ParametricWaveletTransform(nn.Module):
     """
