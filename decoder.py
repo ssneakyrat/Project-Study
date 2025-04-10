@@ -49,4 +49,10 @@ class ComplexDecoder(nn.Module):
         x = self.output_layer(x)
         
         # Convert complex to real for final output
-        return complex_to_real(x)
+        output = complex_to_real(x)
+        
+        # Double-check output is a regular Tensor, not a ComplexTensor
+        if isinstance(output, ComplexTensor):
+            output = torch.sqrt(output.real**2 + output.imag**2)
+        
+        return output

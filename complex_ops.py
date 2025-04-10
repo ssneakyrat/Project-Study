@@ -91,4 +91,8 @@ def complex_to_real(x):
     if not isinstance(x, ComplexTensor):
         return x
         
-    return torch.sqrt(x.real**2 + x.imag**2)
+    # Ensure we return a standard torch tensor, not a ComplexTensor
+    magnitude = torch.sqrt(x.real**2 + x.imag**2)
+    assert not isinstance(magnitude, ComplexTensor), "Magnitude calculation still resulted in ComplexTensor!"
+    
+    return magnitude
