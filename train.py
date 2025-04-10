@@ -23,8 +23,8 @@ def main(args):
         wst_Q=args.wst_Q,
         channels=args.channels,
         latent_dim=args.latent_dim,
-        kernel_size=args.kernel_size,
-        stride=args.stride,
+        kernel_sizes=args.kernel_sizes,
+        strides=args.strides,
         compression_factor=args.compression_factor,
         learning_rate=args.learning_rate
     )
@@ -69,8 +69,8 @@ if __name__ == "__main__":
     parser.add_argument("--wst_Q", type=int, default=8)
     parser.add_argument("--channels", type=int, nargs="+", default=[64, 128, 256])
     parser.add_argument("--latent_dim", type=int, default=64)
-    parser.add_argument("--kernel_size", type=int, nargs="+", default=[5, 5, 5])
-    parser.add_argument("--stride", type=int, nargs="+", default=[2, 2, 2])
+    parser.add_argument("--kernel_sizes", type=int, nargs="+", default=[5, 5, 5])
+    parser.add_argument("--strides", type=int, nargs="+", default=[2, 2, 2])
     parser.add_argument("--compression_factor", type=int, default=16)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     
