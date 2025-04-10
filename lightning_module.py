@@ -91,7 +91,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         )
         
         # Convert complex output to real
-        self.to_real = ComplexToReal(mode='magnitude')
+        self.to_real = ComplexToReal(mode='magnitude')  # Try 'real' instead of 'magnitude'
         
         # Initialize loss functions
         self.stft_loss = ComplexSTFTLoss()

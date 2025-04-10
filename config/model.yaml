@@ -14,7 +14,7 @@ data:
 
 # Wavelet Scattering Transform parameters
 wavelet:
-  J: 6  # Reduced from 8 for better temporal resolution
+  J: 4  # Reduced from 4 16x temporal downsampling
   Q: 8  # Number of wavelets per octave
   T: 8192  # Temporal support of the lowpass filter
   ensure_output_dim: true  # New flag to enforce dimension matching
@@ -45,7 +45,7 @@ training:
 
 # Loss weights
 loss:
-  l1_weight: 0.5
+  l1_weight: 1.0  # Increased from 0.5
   stft_weight: 1.0
   complex_loss_weight: 0.25
   spectral_convergence_weight: 0.5

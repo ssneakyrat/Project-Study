@@ -131,7 +131,8 @@ class ComplexDecoder(nn.Module):
             # else:
             #     print(f"Decoder layer {i} output shape: {x.shape}")
             
-            # Add skip connection if available
+            # In models/decoder.py, in ComplexDecoder.forward() method
+            # Replace the problematic skip connection code with this
             if skip_connections is not None and i < len(skip_connections):
                 skip = skip_connections[i]
                 
@@ -140,25 +141,25 @@ class ComplexDecoder(nn.Module):
                     x_real, x_imag = x
                     skip_real, skip_imag = skip
                     
-                    # Ensure skip connection channels match current layer
+                    # FIX 1: Adapt channel dimensions if they don't match
                     if x_real.shape[1] != skip_real.shape[1]:
-                        # Number of channels doesn't match - can't use this skip connection
-                        continue
-                        
-                    # Resize skip connection if time dimensions don't match
+                        # Use proper 1x1 convolution for channel adaptation
+                        conv_weight = torch.ones(x_real.shape[1], skip_real.shape[1], 1, 
+                                                device=x_real.device) / skip_real.shape[1]
+                        skip_real = F.conv1d(skip_real, conv_weight)
+                        skip_imag = F.conv1d(skip_imag, conv_weight)
+                            
+                    # FIX 2: Always interpolate time dimensions - more robust approach
                     if x_real.shape[2] != skip_real.shape[2]:
-                        try:
-                            # Try to interpolate to match dimensions
-                            skip_real = F.interpolate(skip_real, size=x_real.shape[2], mode='linear', align_corners=False)
-                            skip_imag = F.interpolate(skip_imag, size=x_imag.shape[2], mode='linear', align_corners=False)
-                        except RuntimeError:
-                            # If interpolation fails (e.g., for extreme size differences), skip this connection
-                            continue
+                        # Use resize instead of interpolate for more robustness
+                        skip_real = F.interpolate(skip_real, size=x_real.shape[2], 
+                                                mode='nearest')
+                        skip_imag = F.interpolate(skip_imag, size=x_imag.shape[2], 
+                                                mode='nearest')
                     
-                    # Apply skip connection with dimensionality check
-                    if x_real.shape == skip_real.shape and x_imag.shape == skip_imag.shape:
-                        alpha = 0.5  # Weighting factor for skip connection
-                        x = (x_real + alpha * skip_real, x_imag + alpha * skip_imag)
+                    # Apply skip connection
+                    alpha = 0.5  # Weighting factor for skip connection
+                    x = (x_real + alpha * skip_real, x_imag + alpha * skip_imag)
         
         return x
 
