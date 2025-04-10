@@ -34,6 +34,13 @@ class WaveletScatteringTransform(nn.Module):
                 self.total_coeffs = Sx.shape[1] * Sx.shape[2]
             else:
                 self.total_coeffs = Sx.shape[1]
+            
+            # Calculate normalization statistics for more stable training
+            random_input = torch.randn(16, 1, T)
+            random_sx = self.scattering(random_input)
+            
+            # Compute mean magnitude of coefficients for better normalization
+            self.scale_factor = torch.mean(torch.abs(random_sx)).item()
         
     def forward(self, x):
         """
@@ -68,8 +75,8 @@ class WaveletScatteringTransform(nn.Module):
             B, O, C, T = Sx.shape
             Sx = Sx.reshape(B, O * C, T)
         
-        # Apply log1p to increase dynamic range of coefficients
-        # This helps preserve low-amplitude information
-        Sx = torch.log1p(torch.abs(Sx)) * torch.sign(Sx)
+        # Apply proper normalization to preserve phase information
+        # Avoid the previous log1p transform which distorts phase
+        Sx = Sx / (self.scale_factor + 1e-8)
         
         return Sx

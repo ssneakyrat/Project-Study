@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import matplotlib.pyplot as plt
 import numpy as np
+import math
 from complex_layers import (
     ComplexConv1d, ComplexConvTranspose1d, ComplexBatchNorm1d, 
     ComplexPReLU, ComplexToReal, RealToComplex
@@ -17,7 +18,7 @@ class WSTVocoder(pl.LightningModule):
                  wst_J=8,
                  wst_Q=8,
                  channels=[64, 128, 256],
-                 latent_dim=64,
+                 latent_dim=None,  # Will be calculated dynamically
                  kernel_sizes=[5, 5, 5],
                  strides=[2, 2, 2],
                  compression_factor=16,
@@ -29,7 +30,7 @@ class WSTVocoder(pl.LightningModule):
             wst_J: Number of scales for WST
             wst_Q: Number of wavelets per octave for WST
             channels: List of channel dimensions for encoder/decoder
-            latent_dim: Dimension of latent space
+            latent_dim: Dimension of latent space (if None, calculated dynamically)
             kernel_sizes: List of kernel sizes for encoder/decoder
             strides: List of strides for encoder/decoder
             compression_factor: Compression factor for latent dimension
@@ -41,7 +42,7 @@ class WSTVocoder(pl.LightningModule):
         self.sample_rate = sample_rate
         self.learning_rate = learning_rate
         self.channels = channels
-        self.latent_dim = latent_dim
+        self.compression_factor = compression_factor
         
         # WST layer
         self.wst = WaveletScatteringTransform(
@@ -58,6 +59,19 @@ class WSTVocoder(pl.LightningModule):
             dummy_output = self.wst(dummy_input)
             self.wst_channels = dummy_output.shape[1]
             self.wst_time_dim = dummy_output.shape[2]
+            
+            # Calculate bottleneck dimensions using the formula d = √(T×F)/c
+            # Where T is time, F is frequency bins, c is compression factor
+            T = self.wst_time_dim
+            F = self.wst_channels
+            self.latent_dim = int(math.sqrt(T * F) / compression_factor)
+            
+            # Make sure latent_dim is at least 16 for stability
+            self.latent_dim = max(16, self.latent_dim)
+            
+            if latent_dim is not None:
+                # Override with user-specified value if provided
+                self.latent_dim = latent_dim
         
         # Store original length for final upsampling
         self.original_length = sample_rate * 2
@@ -68,6 +82,7 @@ class WSTVocoder(pl.LightningModule):
         # Encoder
         self.encoder_layers = nn.ModuleList()
         
+        current_time_dim = self.wst_time_dim
         for i, (out_channels, kernel_size, stride) in enumerate(zip(channels, kernel_sizes, strides)):
             self.encoder_layers.append(
                 nn.Sequential(
@@ -82,11 +97,13 @@ class WSTVocoder(pl.LightningModule):
                     ComplexPReLU()
                 )
             )
+            # Update current time dimension for next layer
+            current_time_dim = (current_time_dim + 2*(kernel_size // 2) - kernel_size) // stride + 1
         
         # Latent projection
         self.latent_projection = ComplexConv1d(
             channels[-1],
-            latent_dim,
+            self.latent_dim,
             kernel_size=1
         )
         
@@ -95,7 +112,7 @@ class WSTVocoder(pl.LightningModule):
         
         for i, (in_channels, out_channels, kernel_size, stride) in enumerate(
             zip(
-                [latent_dim] + channels[:-1],
+                [self.latent_dim] + channels[:-1],
                 channels,
                 kernel_sizes,
                 strides
@@ -126,12 +143,12 @@ class WSTVocoder(pl.LightningModule):
             output_padding=strides[0] - 1
         )
         
-        # Convert complex back to real
-        self.complex_to_real = ComplexToReal(mode='real')
+        # Phase-aware complex to real conversion
+        self.complex_to_real = ComplexToReal(mode='magnitude')
         
         # Skip projections from encoder outputs to decoder inputs
         encoder_channels = channels  # [64, 128, 256]
-        decoder_input_channels = [latent_dim] + channels[:-1]  # [64, 64, 128]
+        decoder_input_channels = [self.latent_dim] + channels[:-1]  # [latent_dim, 64, 128]
         
         self.skip_projections = nn.ModuleList()
         for i in range(len(encoder_channels)):
@@ -176,6 +193,7 @@ class WSTVocoder(pl.LightningModule):
         B, C, T = x_wst.shape
         self.log("wst_channels", C, on_step=False, on_epoch=True)
         self.log("wst_timesteps", T, on_step=False, on_epoch=True)
+        self.log("latent_dim", self.latent_dim, on_step=False, on_epoch=True)
         
         # Convert to complex
         x_complex = self.real_to_complex(x_wst)
@@ -191,6 +209,10 @@ class WSTVocoder(pl.LightningModule):
         # Latent space
         z = self.latent_projection(x_complex)
         
+        # Calculate and log latent space statistics
+        z_mag = torch.abs(z).mean().item()
+        self.log("latent_magnitude", z_mag, on_step=False, on_epoch=True)
+        
         # Decoder with skip connections
         x_complex = z
         
@@ -205,12 +227,20 @@ class WSTVocoder(pl.LightningModule):
                 
                 # Resize time dimension if needed using interpolation
                 if skip.shape[2] != x_complex.shape[2]:
-                    skip_real = F.interpolate(skip.real, size=x_complex.shape[2], mode='linear', align_corners=False)
-                    skip_imag = F.interpolate(skip.imag, size=x_complex.shape[2], mode='linear', align_corners=False)
-                    skip = torch.complex(skip_real, skip_imag)
+                    # Simple but potentially less artifact-prone approach: 
+                    # Match dimensions by trimming or padding instead of interpolation
+                    if skip.shape[2] > x_complex.shape[2]:
+                        # Trim
+                        skip = skip[:, :, :x_complex.shape[2]]
+                    else:
+                        # Pad
+                        pad_size = x_complex.shape[2] - skip.shape[2]
+                        skip_real = F.pad(skip.real, (0, pad_size))
+                        skip_imag = F.pad(skip.imag, (0, pad_size))
+                        skip = torch.complex(skip_real, skip_imag)
                 
-                # Add skip connection
-                x_complex = x_complex + skip
+                # Add skip connection with scaling factor to avoid dominating the signal
+                x_complex = x_complex + 0.1 * skip
             
             # Apply decoder layer
             x_complex = layer(x_complex)
@@ -218,7 +248,7 @@ class WSTVocoder(pl.LightningModule):
         # Output layer
         x_complex = self.output_layer(x_complex)
         
-        # Convert to real
+        # Convert to real using magnitude instead of just real part to preserve energy
         x_out = self.complex_to_real(x_complex).squeeze(1)
         
         # The final output may still not match the original audio length
@@ -238,10 +268,26 @@ class WSTVocoder(pl.LightningModule):
             # Resize output to match input if needed (should not happen with proper upsampling)
             x_hat = F.interpolate(x_hat.unsqueeze(1), size=x.shape[1], mode='linear', align_corners=False).squeeze(1)
         
-        # L1 loss
-        loss = F.l1_loss(x_hat, x)
+        # L1 loss + spectral loss for better convergence
+        l1_loss = F.l1_loss(x_hat, x)
+        
+        # Simplified spectral loss using FFT
+        X = torch.fft.rfft(x, dim=1)
+        X_hat = torch.fft.rfft(x_hat, dim=1)
+        
+        # Magnitude spectral loss (log domain to emphasize relative differences)
+        spec_loss = F.mse_loss(
+            torch.log1p(torch.abs(X) + 1e-8),
+            torch.log1p(torch.abs(X_hat) + 1e-8)
+        )
+        
+        # Combined loss
+        loss = l1_loss + 0.1 * spec_loss
         
         self.log('train_loss', loss)
+        self.log('train_l1_loss', l1_loss)
+        self.log('train_spec_loss', spec_loss)
+        
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -254,10 +300,25 @@ class WSTVocoder(pl.LightningModule):
             # Resize output to match input if needed (should not happen with proper upsampling)
             x_hat = F.interpolate(x_hat.unsqueeze(1), size=x.shape[1], mode='linear', align_corners=False).squeeze(1)
         
-        # L1 loss
-        loss = F.l1_loss(x_hat, x)
+        # L1 loss + spectral loss
+        l1_loss = F.l1_loss(x_hat, x)
+        
+        # Simplified spectral loss using FFT
+        X = torch.fft.rfft(x, dim=1)
+        X_hat = torch.fft.rfft(x_hat, dim=1)
+        
+        # Magnitude spectral loss (log domain to emphasize relative differences)
+        spec_loss = F.mse_loss(
+            torch.log1p(torch.abs(X) + 1e-8),
+            torch.log1p(torch.abs(X_hat) + 1e-8)
+        )
+        
+        # Combined loss
+        loss = l1_loss + 0.1 * spec_loss
         
         self.log('val_loss', loss)
+        self.log('val_l1_loss', l1_loss)
+        self.log('val_spec_loss', spec_loss)
         
         # Log audio and visualizations for first batch only to save computation
         if batch_idx == 0:
@@ -375,7 +436,7 @@ class WSTVocoder(pl.LightningModule):
         return loss
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=1e-6)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=5, verbose=True
         )
@@ -387,48 +448,3 @@ class WSTVocoder(pl.LightningModule):
                 "interval": "epoch"
             }
         }
-
-
-class WSTVocoderLoss(nn.Module):
-    """Loss function for WST vocoder.
-    
-    Combines L1 loss, spectral loss, and potentially adversarial loss.
-    """
-    def __init__(self, alpha=1.0, beta=1.0, gamma=0.0):
-        """
-        Args:
-            alpha: Weight for L1 loss
-            beta: Weight for spectral loss
-            gamma: Weight for adversarial loss (if used)
-        """
-        super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        
-    def forward(self, x_hat, x, d_fake=None):
-        """
-        Args:
-            x_hat: Reconstructed audio
-            x: Original audio
-            d_fake: Discriminator output for fake audio (if using adversarial loss)
-        
-        Returns:
-            Weighted sum of losses
-        """
-        # L1 loss
-        l1_loss = F.l1_loss(x_hat, x)
-        
-        # Spectral loss (simplified for PoC)
-        # In a full implementation, we would use STFT loss
-        spec_loss = torch.tensor(0.0, device=x.device)
-        
-        # Adversarial loss (if using)
-        adv_loss = torch.tensor(0.0, device=x.device)
-        if d_fake is not None and self.gamma > 0:
-            adv_loss = F.mse_loss(d_fake, torch.ones_like(d_fake))
-        
-        # Total loss
-        total_loss = self.alpha * l1_loss + self.beta * spec_loss + self.gamma * adv_loss
-        
-        return total_loss
