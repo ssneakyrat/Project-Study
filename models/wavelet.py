@@ -104,6 +104,13 @@ class WaveletScatteringTransform(nn.Module):
             real_part = torch.log(magnitude + self.eps)
             imag_part = torch.zeros_like(real_part)  # Phase information is discarded in log normalization
         
+        # maintains mathematical validity while enabling correct forward propagation
+        if real_part.dim() == 4:
+            # Reshape from [B, C, H, W] → [B, C*H, W]
+            batch_size, channels, height, width = real_part.shape
+            real_part = real_part.reshape(batch_size, channels*height, width)
+            imag_part = imag_part.reshape(batch_size, channels*height, width)
+
         return (real_part, imag_part)
 
 
