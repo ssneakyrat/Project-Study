@@ -13,11 +13,11 @@ data:
 
 # Wavelet Scattering Transform parameters
 wavelet:
-  J: 6  # Number of scales
-  Q: 16  # Number of wavelets per octave
-  T: 16384  # Temporal support (must be power of 2)
+  J: 6          # Number of scales - AFFECTS KYMATIO OUTPUT CHANNELS
+  Q: 16         # Number of wavelets per octave - AFFECTS KYMATIO OUTPUT CHANNELS
+  T: 16384      # Temporal support (must be power of 2)
   ensure_output_dim: true
-  max_order: 1  # Use only first-order scattering (simpler, more stable)
+  max_order: 1  # Use only first-order scattering - AFFECTS KYMATIO OUTPUT CHANNELS
   normalize: true
   
 # Model architecture

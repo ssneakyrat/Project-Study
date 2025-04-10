@@ -39,16 +39,15 @@ class WaveletScatteringTransform(nn.Module):
         # Register as buffer to move to correct device
         self.register_buffer('eps', torch.tensor(1e-8))
         
-        # Calculate expected output shape for dimension consistency
+        # Calculate expected output time dimension
         self.expected_output_time_dim = T // (2**J)
         
-        # Calculate expected number of channels (frequency bands)
-        if max_order == 1:
-            # For first-order: lowpass + bandpass filters
-            self.expected_channels = 1 + J * Q
-        else:
-            # For second-order: approximate formula
-            self.expected_channels = 1 + J * Q + (J * Q)**2 // 4
+        # Dynamic detection of actual output channels from Kymatio
+        # Run a dummy input through the scattering transform to detect actual output dimensions
+        dummy_input = torch.zeros((1, T))
+        with torch.no_grad():
+            dummy_output = self.scattering(dummy_input)
+        self.expected_channels = dummy_output.shape[1]  # Get actual channel count
         
         print(f"WST will output {self.expected_channels} channels with temporal dim {self.expected_output_time_dim}")
         

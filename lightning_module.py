@@ -41,18 +41,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
             max_order=config['wavelet'].get('max_order', 1),
             ensure_output_dim=config['wavelet'].get('ensure_output_dim', True)
         )
-        '''
-        # Calculate input channels based on wavelet parameters
-        J, Q = config['wavelet']['J'], config['wavelet']['Q']
-        if config['wavelet'].get('max_order', 1) == 1:
-            # For first-order: lowpass + bandpass filters
-            input_channels = 1 + J * Q
-        else:
-            # For second-order: approximate formula
-            input_channels = 1 + J * Q + (J * Q)**2 // 4
         
-        print(f"Initializing encoder with {input_channels} input channels")
-        '''
         # Determine actual input channels by running a sample through the WST
         # This ensures we match the actual output dimensions from kymatio
         dummy_input = torch.randn(1, config['wavelet']['T'])
