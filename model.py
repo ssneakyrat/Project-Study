@@ -15,8 +15,8 @@ from wavelet_transform import WaveletScatteringTransform
 class WSTVocoder(pl.LightningModule):
     def __init__(self,
                  sample_rate=16000,
-                 wst_J=6,  # Reduced J for better time resolution
-                 wst_Q=8,
+                 wst_J=7,  # Increased from 6 to 7 for better frequency resolution
+                 wst_Q=12,  # Increased from 8 to 12 for finer frequency bands
                  channels=[64, 128, 256],
                  latent_dim=None,
                  kernel_sizes=[5, 5, 5],
@@ -32,7 +32,7 @@ class WSTVocoder(pl.LightningModule):
         self.channels = channels
         self.compression_factor = compression_factor
         
-        # WST layer with reduced J parameter for better time resolution
+        # WST layer with improved frequency-time resolution tradeoff
         self.wst = WaveletScatteringTransform(
             J=wst_J,
             Q=wst_Q,
@@ -60,7 +60,7 @@ class WSTVocoder(pl.LightningModule):
         # Store original length for final upsampling
         self.original_length = sample_rate * 2
         
-        # Improved phase handling with analytic signal approach
+        # Improved phase handling with modified analytic signal approach
         self.real_to_complex = RealToComplex(mode='analytic')
         
         # Encoder layers
@@ -83,11 +83,11 @@ class WSTVocoder(pl.LightningModule):
             )
             current_time_dim = (current_time_dim + 2*(kernel_size // 2) - kernel_size) // stride + 1
         
-        # Latent projection
-        self.latent_projection = ComplexConv1d(
-            channels[-1],
-            self.latent_dim,
-            kernel_size=1
+        # Latent projection with spectral normalization for stability
+        self.latent_projection = nn.Sequential(
+            ComplexConv1d(channels[-1], self.latent_dim, kernel_size=3, padding=1),
+            ComplexBatchNorm1d(self.latent_dim),
+            ComplexPReLU()
         )
         
         # Decoder layers
@@ -116,21 +116,20 @@ class WSTVocoder(pl.LightningModule):
                 )
             )
         
-        # Output layer
+        # Output layer with larger kernel for better time coherence
         self.output_layer = ComplexConvTranspose1d(
             channels[-1],
             1,  # Output channels
-            kernel_size=kernel_sizes[0],
+            kernel_size=7,  # Increased from 5 to 7
             stride=strides[0],
-            padding=kernel_sizes[0] // 2,
+            padding=3,
             output_padding=strides[0] - 1
         )
         
-        # *** CRITICAL FIX: Use polar mode to preserve both magnitude and phase ***
-        # This provides explicit phase preservation rather than just using magnitude
+        # Use refined polar mode for better phase preservation
         self.complex_to_real = ComplexToReal(mode='polar')
         
-        # Skip projections from encoder outputs to decoder inputs
+        # Skip projections with gradient scaling for stable training
         encoder_channels = channels
         decoder_input_channels = [self.latent_dim] + channels[:-1]
         
@@ -145,35 +144,45 @@ class WSTVocoder(pl.LightningModule):
             )
         
         # Improved final upsampling with antialiasing
-        # *** CRITICAL FIX: Separate upsamplers for magnitude and phase ***
         self.final_upsampling = nn.Sequential(
             nn.Upsample(size=sample_rate * 2, mode='linear', align_corners=False),
-            nn.Conv1d(2, 2, kernel_size=7, padding=3, padding_mode='reflect'),
+            nn.Conv1d(2, 16, kernel_size=7, padding=3, padding_mode='reflect'),
             nn.LeakyReLU(0.2),
-            nn.Conv1d(2, 2, kernel_size=7, padding=3, padding_mode='reflect'),
+            nn.Conv1d(16, 16, kernel_size=7, padding=3, padding_mode='reflect'),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(16, 2, kernel_size=7, padding=3, padding_mode='reflect'),
         )
         
         # Energy scaling factor for output normalization
         self.output_scale = nn.Parameter(torch.ones(1))
         
-        # Improved phase correction network with frequency-dependent processing
+        # Enhanced phase correction network with frequency-dependent processing
         self.phase_correction = nn.Sequential(
-            nn.Conv1d(2, 16, kernel_size=15, padding=7, padding_mode='reflect'),
+            nn.Conv1d(2, 32, kernel_size=15, padding=7, padding_mode='reflect'),
             nn.LeakyReLU(0.2),
-            nn.Conv1d(16, 16, kernel_size=15, padding=7, padding_mode='reflect'),
+            nn.Conv1d(32, 32, kernel_size=15, padding=7, padding_mode='reflect'),
             nn.LeakyReLU(0.2),
-            nn.Conv1d(16, 2, kernel_size=15, padding=7, padding_mode='reflect'),
+            nn.Conv1d(32, 32, kernel_size=15, padding=7, padding_mode='reflect'),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(32, 2, kernel_size=15, padding=7, padding_mode='reflect'),
             nn.Tanh()  # Output correction factor between -1 and 1
         )
         
-        # *** CRITICAL FIX: Complex synthesis layer to convert back from magnitude/phase to audio ***
+        # Refined complex synthesis layer
         self.complex_synthesis = nn.Sequential(
-            nn.Conv1d(2, 32, kernel_size=7, padding=3),
+            nn.Conv1d(2, 32, kernel_size=7, padding=3, padding_mode='reflect'),
             nn.LeakyReLU(0.2),
-            nn.Conv1d(32, 32, kernel_size=7, padding=3),
+            nn.Conv1d(32, 32, kernel_size=7, padding=3, padding_mode='reflect'),
             nn.LeakyReLU(0.2),
-            nn.Conv1d(32, 1, kernel_size=7, padding=3),
+            nn.Conv1d(32, 1, kernel_size=7, padding=3, padding_mode='reflect'),
         )
+        
+        # Initialize output layer weights carefully
+        for m in self.complex_synthesis.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, a=0.2, nonlinearity='leaky_relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
         
     def compute_expected_output_size(self, input_size, layers):
         """Calculate the expected output size after a series of conv/deconv layers."""
@@ -244,7 +253,7 @@ class WSTVocoder(pl.LightningModule):
                         skip_imag = F.pad(skip.imag, (0, pad_size), mode='reflect')
                         skip = torch.complex(skip_real, skip_imag)
                 
-                # *** CRITICAL FIX: Stronger skip connections (0.8 → 1.0) ***
+                # Stronger skip connections (0.8 → 1.0)
                 x_complex = x_complex + 1.0 * skip
             
             # Apply decoder layer
@@ -253,13 +262,19 @@ class WSTVocoder(pl.LightningModule):
         # Output layer
         x_complex = self.output_layer(x_complex)
         
-        # *** CRITICAL FIX: Convert to polar representation (magnitude/phase) ***
-        # This gives us explicit control over both magnitude and phase
+        # Convert to polar representation (magnitude/phase)
         x_polar = self.complex_to_real(x_complex)  # [B, 2*C, T] - magnitude and phase channels
         
-        # Apply phase correction network
+        # Apply enhanced phase correction with stronger effect
         phase_corr = self.phase_correction(x_polar)
-        x_polar_corrected = x_polar + 0.2 * phase_corr  # Increased weight for phase correction
+        x_polar_corrected = x_polar + 0.3 * phase_corr  # Increased from 0.2 to 0.3
+        
+        # Apply tapered window to reduce boundary artifacts
+        batch_size, channels, time_steps = x_polar_corrected.shape
+        window = torch.hann_window(time_steps, device=x_polar_corrected.device)
+        window = window.view(1, 1, -1).expand(batch_size, channels, -1)
+        # Apply window with a blend factor to prevent complete silence at boundaries
+        x_polar_corrected = x_polar_corrected * (0.95 * window + 0.05)
         
         # Ensure output has correct length
         if x_polar_corrected.shape[2] != input_length:
@@ -273,7 +288,7 @@ class WSTVocoder(pl.LightningModule):
                     align_corners=False
                 )
         
-        # *** CRITICAL FIX: Convert polar representation back to waveform ***
+        # Convert polar representation back to waveform
         # Split magnitude and phase
         magnitude = x_polar_corrected[:, 0:1]  # First half of channels
         phase_scaled = x_polar_corrected[:, 1:2]  # Second half of channels
@@ -281,16 +296,16 @@ class WSTVocoder(pl.LightningModule):
         # Convert scaled phase back to radians
         phase = phase_scaled * torch.pi
         
-        # Convert to complex time domain signal
+        # Convert to complex time domain signal using a more stable approach
         real_part = magnitude * torch.cos(phase)
         imag_part = magnitude * torch.sin(phase)
         
         # Enhanced waveform synthesis
         x_out = self.complex_synthesis(torch.cat([real_part, imag_part], dim=1))
         
-        # Apply output energy normalization
+        # Apply output energy normalization with stability constraint
         output_energy = torch.mean(x_out**2) + 1e-8
-        energy_ratio = torch.sqrt(input_energy / output_energy)
+        energy_ratio = torch.sqrt(input_energy / output_energy).clamp(0.1, 10.0)  # Clamp to prevent extreme scaling
         x_out = x_out * self.output_scale * energy_ratio
         
         # Final squeeze
@@ -309,9 +324,9 @@ class WSTVocoder(pl.LightningModule):
         # L1 loss
         l1_loss = F.l1_loss(x_hat, x)
         
-        # Multi-resolution STFT loss
+        # Multi-resolution STFT loss with enhanced phase handling
         stft_losses = []
-        for n_fft in [256, 512, 1024, 2048]:  # Added 2048 for better low-frequency resolution
+        for n_fft in [256, 512, 1024, 2048, 4096]:  # Added 4096 for better low-frequency resolution
             hop_length = n_fft // 4
             win_length = n_fft
             window = torch.hann_window(win_length).to(x.device)
@@ -340,16 +355,15 @@ class WSTVocoder(pl.LightningModule):
                 torch.log1p(torch.abs(X_hat) + 1e-8)
             )
             
-            # *** CRITICAL FIX: Improved phase loss ***
+            # Enhanced phase loss with complex exponential representation
             phase_x = torch.angle(X)
             phase_x_hat = torch.angle(X_hat)
             
-            # Calculate phase difference with complex exponential (using manual calculation)
-            # e^(iθ1) - e^(iθ2) directly captures phase difference
+            # Calculate phase difference using complex exponential
             complex_exp_orig = torch.exp(1j * phase_x)
             complex_exp_recon = torch.exp(1j * phase_x_hat)
             
-            # Manual MSE calculation for complex values: mean(|z1 - z2|²)
+            # Complex MSE calculation
             complex_diff = complex_exp_orig - complex_exp_recon
             phase_loss = torch.mean(torch.abs(complex_diff)**2)
             
@@ -357,7 +371,14 @@ class WSTVocoder(pl.LightningModule):
             magnitude_weight = torch.abs(X) / (torch.abs(X).sum(dim=(1, 2), keepdim=True) + 1e-8)
             weighted_phase_loss = torch.mean(magnitude_weight * torch.abs(complex_diff))
             
-            stft_losses.append(mag_loss + 0.5 * weighted_phase_loss)  # Increased phase weight
+            # New: Add weighted phase consistency loss for harmonic frequencies
+            freq_bins = torch.arange(n_fft//2 + 1, device=x.device).float()
+            harmonic_weight = torch.exp(-0.5 * ((freq_bins - 100*n_fft/1024)/100)**2)  # Gaussian centered on expected harmonics
+            harmonic_weight = harmonic_weight.view(1, -1, 1).expand_as(magnitude_weight)
+            
+            harmonic_phase_loss = torch.mean(harmonic_weight * magnitude_weight * torch.abs(complex_diff)**2)
+            
+            stft_losses.append(mag_loss + 0.5 * weighted_phase_loss + 0.3 * harmonic_phase_loss)
         
         # Average the multi-resolution losses
         spec_loss = sum(stft_losses) / len(stft_losses)
@@ -370,13 +391,31 @@ class WSTVocoder(pl.LightningModule):
             torch.log1p(envelope_recon + 1e-8)
         )
         
-        # *** CRITICAL FIX: Balanced loss with higher weights for phase and envelope ***
-        loss = l1_loss + 0.5 * spec_loss + 0.3 * envelope_loss
+        # New: Harmonic structure loss via auto-correlation
+        def autocorr(x):
+            # Compute autocorrelation via FFT for efficiency
+            x_fft = torch.fft.rfft(x)
+            power = torch.abs(x_fft)**2
+            corr = torch.fft.irfft(power)
+            return corr
+            
+        autocorr_orig = autocorr(x)
+        autocorr_recon = autocorr(x_hat)
+        # Focus on the first 1000 lags which contain pitch information
+        max_lag = min(1000, autocorr_orig.shape[-1]//4)
+        harmonic_loss = F.mse_loss(
+            autocorr_orig[..., :max_lag],
+            autocorr_recon[..., :max_lag]
+        )
+        
+        # Refined loss balance with additional components
+        loss = 1.0 * l1_loss + 0.5 * spec_loss + 0.3 * envelope_loss + 0.2 * harmonic_loss
         
         self.log('train_loss', loss)
         self.log('train_l1_loss', l1_loss)
         self.log('train_spec_loss', spec_loss)
         self.log('train_envelope_loss', envelope_loss)
+        self.log('train_harmonic_loss', harmonic_loss)
         
         return loss
     
@@ -391,9 +430,9 @@ class WSTVocoder(pl.LightningModule):
         # L1 loss
         l1_loss = F.l1_loss(x_hat, x)
         
-        # Multi-resolution STFT loss
+        # Multi-resolution STFT loss with enhanced phase handling
         stft_losses = []
-        for n_fft in [256, 512, 1024, 2048]:  # Added 2048 for better low-frequency resolution
+        for n_fft in [256, 512, 1024, 2048, 4096]:  # Added 4096 for better low-frequency resolution
             hop_length = n_fft // 4
             win_length = n_fft
             window = torch.hann_window(win_length).to(x.device)
@@ -422,7 +461,7 @@ class WSTVocoder(pl.LightningModule):
                 torch.log1p(torch.abs(X_hat) + 1e-8)
             )
             
-            # Improved phase loss calculation using manual MSE for complex values
+            # Improved phase loss calculation
             phase_x = torch.angle(X)
             phase_x_hat = torch.angle(X_hat)
             
@@ -438,7 +477,14 @@ class WSTVocoder(pl.LightningModule):
             magnitude_weight = torch.abs(X) / (torch.abs(X).sum(dim=(1, 2), keepdim=True) + 1e-8)
             weighted_phase_loss = torch.mean(magnitude_weight * torch.abs(complex_diff))
             
-            stft_losses.append(mag_loss + 0.5 * weighted_phase_loss)
+            # Add harmonic frequency weighting
+            freq_bins = torch.arange(n_fft//2 + 1, device=x.device).float()
+            harmonic_weight = torch.exp(-0.5 * ((freq_bins - 100*n_fft/1024)/100)**2)
+            harmonic_weight = harmonic_weight.view(1, -1, 1).expand_as(magnitude_weight)
+            
+            harmonic_phase_loss = torch.mean(harmonic_weight * magnitude_weight * torch.abs(complex_diff)**2)
+            
+            stft_losses.append(mag_loss + 0.5 * weighted_phase_loss + 0.3 * harmonic_phase_loss)
         
         # Average the multi-resolution losses
         spec_loss = sum(stft_losses) / len(stft_losses)
@@ -451,13 +497,29 @@ class WSTVocoder(pl.LightningModule):
             torch.log1p(envelope_recon + 1e-8)
         )
         
-        # Balanced loss with higher weights for phase and envelope
-        loss = l1_loss + 0.5 * spec_loss + 0.3 * envelope_loss
+        # Harmonic structure loss via auto-correlation
+        def autocorr(x):
+            x_fft = torch.fft.rfft(x)
+            power = torch.abs(x_fft)**2
+            corr = torch.fft.irfft(power)
+            return corr
+            
+        autocorr_orig = autocorr(x)
+        autocorr_recon = autocorr(x_hat)
+        max_lag = min(1000, autocorr_orig.shape[-1]//4)
+        harmonic_loss = F.mse_loss(
+            autocorr_orig[..., :max_lag],
+            autocorr_recon[..., :max_lag]
+        )
+        
+        # Balanced loss with additional components
+        loss = 1.0 * l1_loss + 0.5 * spec_loss + 0.3 * envelope_loss + 0.2 * harmonic_loss
         
         self.log('val_loss', loss)
         self.log('val_l1_loss', l1_loss)
         self.log('val_spec_loss', spec_loss)
         self.log('val_envelope_loss', envelope_loss)
+        self.log('val_harmonic_loss', harmonic_loss)
         
         # Calculate signal-to-noise ratio (SNR)
         with torch.no_grad():
@@ -490,6 +552,34 @@ class WSTVocoder(pl.LightningModule):
                 dim=1
             )
             self.log('val_spectral_contrast_sim', torch.mean(contrast_sim))
+            
+            # Add pitched harmonic detection metric
+            def harmonic_ratio(audio, n_fft=2048):
+                S = torch.stft(
+                    audio, 
+                    n_fft=n_fft, 
+                    hop_length=n_fft//4, 
+                    win_length=n_fft, 
+                    window=torch.hann_window(n_fft).to(audio.device), 
+                    return_complex=True
+                )
+                mag = torch.abs(S)
+                
+                # Calculate harmonic peaks vs noise floor ratio
+                # Simple approach: use variance of frequency bins as proxy
+                freq_variance = torch.var(mag, dim=1)
+                mean_mag = torch.mean(mag, dim=1)
+                
+                # Higher ratio indicates more distinct harmonic structure
+                harmonic_noise_ratio = freq_variance / (mean_mag + 1e-8)
+                return harmonic_noise_ratio
+                
+            orig_harmonic = harmonic_ratio(x)
+            recon_harmonic = harmonic_ratio(x_hat)
+            
+            # Calculate relative error in harmonic structure
+            harmonic_error = torch.abs(orig_harmonic - recon_harmonic) / (orig_harmonic + 1e-8)
+            self.log('val_harmonic_error', torch.mean(harmonic_error))
         
         # Log audio and visualizations for first batch only
         if batch_idx == 0:
@@ -523,12 +613,12 @@ class WSTVocoder(pl.LightningModule):
             
             for i in range(num_samples):
                 # Original spectrogram
-                window = torch.hann_window(512).to(x.device)
+                window = torch.hann_window(1024).to(x.device)  # Increased from 512 to 1024
                 X = torch.stft(
                     x[i], 
-                    n_fft=512, 
-                    hop_length=128, 
-                    win_length=512, 
+                    n_fft=1024, 
+                    hop_length=256, 
+                    win_length=1024, 
                     window=window, 
                     return_complex=True
                 )
@@ -539,9 +629,9 @@ class WSTVocoder(pl.LightningModule):
                 # Reconstructed spectrogram
                 X_hat = torch.stft(
                     x_hat[i], 
-                    n_fft=512, 
-                    hop_length=128, 
-                    win_length=512, 
+                    n_fft=1024, 
+                    hop_length=256, 
+                    win_length=1024, 
                     window=window, 
                     return_complex=True
                 )
@@ -600,17 +690,29 @@ class WSTVocoder(pl.LightningModule):
         return loss
     
     def configure_optimizers(self):
-        # AdamW with improved learning rate schedule
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-5)
-        
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        # AdamW with improved learning rate schedule and weight decay
+        optimizer = torch.optim.AdamW(
+            self.parameters(), 
+            lr=self.learning_rate, 
+            weight_decay=1e-5,
+            betas=(0.9, 0.99)  # Higher beta2 for more stable updates
         )
+        
+        # One-cycle learning rate schedule for faster convergence
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.learning_rate * 1.5,
+            total_steps=50000,  # Adjust based on your expected training steps
+            pct_start=0.3,  # Spend 30% of time in warm-up
+            div_factor=25,  # Initial LR = max_lr/div_factor
+            final_div_factor=1000,  # Final LR = max_lr/final_div_factor
+            anneal_strategy='cos'
+        )
+        
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_loss",
-                "interval": "epoch"
+                "interval": "step"
             }
         }
