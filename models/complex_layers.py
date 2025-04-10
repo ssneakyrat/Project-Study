@@ -39,7 +39,7 @@ class ComplexConv1d(nn.Module):
         
     def forward(self, x):
         """
-        Forward pass with consistent dimension handling
+        Forward pass
         
         Args:
             x: Either a ComplexTensor, tuple of (real, imag) tensors, or real tensor
@@ -54,34 +54,6 @@ class ComplexConv1d(nn.Module):
             x_real, x_imag = x
         else:  # Handle the case where input is real
             x_real, x_imag = x, torch.zeros_like(x)
-        
-        # First handle extra dimensions
-        if x_real.dim() > 3:
-            print(f"WARNING: Input has too many dimensions: {x_real.shape}, squeezing...")
-            x_real = x_real.squeeze(2)
-            x_imag = x_imag.squeeze(2)
-        
-        # CRITICAL DIMENSION HANDLING - Ensure [B, C, T] format
-        # Check if channels and time are swapped and fix if needed
-        if x_real.dim() == 3 and x_real.size(2) == self.in_channels and x_real.size(1) != self.in_channels:
-            print(f"WARNING: Input has swapped dimensions [B, T, C]: {x_real.shape}, transposing...")
-            x_real = x_real.transpose(1, 2)
-            x_imag = x_imag.transpose(1, 2)
-        
-        # Check and fix channel dimensions if needed
-        if x_real.size(1) != self.in_channels:
-            print(f"Adjusting channel dimensions from {x_real.size(1)} to {self.in_channels}")
-            # Create adapted tensors
-            adapted_real = torch.zeros(x_real.size(0), self.in_channels, x_real.size(2), device=x_real.device)
-            adapted_imag = torch.zeros(x_imag.size(0), self.in_channels, x_imag.size(2), device=x_imag.device)
-            
-            # Copy as many channels as we can
-            copy_channels = min(x_real.size(1), self.in_channels)
-            adapted_real[:, :copy_channels] = x_real[:, :copy_channels]
-            adapted_imag[:, :copy_channels] = x_imag[:, :copy_channels]
-            
-            x_real = adapted_real
-            x_imag = adapted_imag
         
         # Regular convolution operations
         real = self.conv_re(x_real) - self.conv_im(x_imag)
@@ -122,7 +94,7 @@ class ComplexConvTranspose1d(nn.Module):
 
     def forward(self, x):
         """
-        Forward pass with consistent dimension handling
+        Forward pass
         
         Args:
             x: Either a ComplexTensor, tuple of (real, imag) tensors, or real tensor
@@ -137,28 +109,6 @@ class ComplexConvTranspose1d(nn.Module):
             x_real, x_imag = x
         else:  # Handle the case where input is real
             x_real, x_imag = x, torch.zeros_like(x)
-        
-        # CRITICAL DIMENSION HANDLING - Ensure [B, C, T] format
-        # Check if channels and time are swapped and fix if needed
-        if x_real.dim() == 3 and x_real.size(2) == self.in_channels and x_real.size(1) != self.in_channels:
-            print(f"WARNING: Input has swapped dimensions [B, T, C]: {x_real.shape}, transposing...")
-            x_real = x_real.transpose(1, 2)
-            x_imag = x_imag.transpose(1, 2)
-            
-        # Check and fix channel dimensions if needed
-        if x_real.size(1) != self.in_channels:
-            print(f"Adjusting channel dimensions from {x_real.size(1)} to {self.in_channels}")
-            # Create adapted tensors
-            adapted_real = torch.zeros(x_real.size(0), self.in_channels, x_real.size(2), device=x_real.device)
-            adapted_imag = torch.zeros(x_imag.size(0), self.in_channels, x_imag.size(2), device=x_imag.device)
-            
-            # Copy as many channels as we can
-            copy_channels = min(x_real.size(1), self.in_channels)
-            adapted_real[:, :copy_channels] = x_real[:, :copy_channels]
-            adapted_imag[:, :copy_channels] = x_imag[:, :copy_channels]
-            
-            x_real = adapted_real
-            x_imag = adapted_imag
         
         # Real component: (W_re * x_re - W_im * x_im)
         real = self.deconv_re(x_real) - self.deconv_im(x_imag)
@@ -191,10 +141,10 @@ class ComplexBatchNorm1d(nn.Module):
         Forward pass
         
         Args:
-            x (tuple): Tuple of (real, imag) tensors
+            x (tuple): Tuple of (real, imag) tensors with shape [B, C, T] each
             
         Returns:
-            tuple: Tuple of (real, imag) tensors
+            tuple: Tuple of (real, imag) tensors with shape [B, C, T] each
         """
         if isinstance(x, ComplexTensor):
             x_real, x_imag = x.real, x.imag
@@ -226,10 +176,10 @@ class ComplexLeakyReLU(nn.Module):
         Forward pass
         
         Args:
-            x (tuple): Tuple of (real, imag) tensors
+            x (tuple): Tuple of (real, imag) tensors with shape [B, C, T] each
             
         Returns:
-            tuple: Tuple of (real, imag) tensors
+            tuple: Tuple of (real, imag) tensors with shape [B, C, T] each
         """
         if isinstance(x, ComplexTensor):
             x_real, x_imag = x.real, x.imag
@@ -255,10 +205,10 @@ class ComplexTanh(nn.Module):
         Forward pass
         
         Args:
-            x (tuple): Tuple of (real, imag) tensors
+            x (tuple): Tuple of (real, imag) tensors with shape [B, C, T] each
             
         Returns:
-            tuple: Tuple of (real, imag) tensors
+            tuple: Tuple of (real, imag) tensors with shape [B, C, T] each
         """
         if isinstance(x, ComplexTensor):
             x_real, x_imag = x.real, x.imag
@@ -266,10 +216,6 @@ class ComplexTanh(nn.Module):
             x_real, x_imag = x
         else:
             x_real, x_imag = x, torch.zeros_like(x)
-        
-        # Complex tanh implementation
-        # Mathematically more correct approach:
-        # tanh(z) = (e^z - e^-z) / (e^z + e^-z) for complex z
         
         # Simple approximation - applying tanh separately to real and imaginary parts
         real = torch.tanh(x_real)
@@ -294,10 +240,10 @@ class ComplexDropout(nn.Module):
         Forward pass
         
         Args:
-            x (tuple): Tuple of (real, imag) tensors
+            x (tuple): Tuple of (real, imag) tensors with shape [B, C, T] each
             
         Returns:
-            tuple: Tuple of (real, imag) tensors
+            tuple: Tuple of (real, imag) tensors with shape [B, C, T] each
         """
         if isinstance(x, ComplexTensor):
             x_real, x_imag = x.real, x.imag
@@ -333,10 +279,10 @@ class ComplexToReal(nn.Module):
         Forward pass with improved phase preservation
         
         Args:
-            x (tuple): Tuple of (real, imag) tensors
+            x (tuple): Tuple of (real, imag) tensors with shape [B, C, T] each
             
         Returns:
-            Tensor: Real-valued tensor
+            Tensor: Real-valued tensor with shape [B, C, T] or [B, T] if C=1
         """
         if isinstance(x, ComplexTensor):
             x_real, x_imag = x.real, x.imag
@@ -380,4 +326,8 @@ class ComplexToReal(nn.Module):
             # Replace NaN/Inf with zeros with small noise
             out = torch.nan_to_num(out, nan=1e-6, posinf=1.0, neginf=-1.0)
         
+        # If output has a single channel and we're returning audio, squeeze the channel dimension
+        if out.size(1) == 1 and self.mode == 'mag_phase':
+            out = out.squeeze(1)
+            
         return out

@@ -79,6 +79,10 @@ class AudioDataset(Dataset):
         if self.transform:
             audio = self.transform(audio)
             
+        # Ensure audio is [T] (time only, no batch or channel dimension)
+        if audio.dim() > 1:
+            audio = audio.squeeze()
+            
         return audio
 
 
@@ -175,6 +179,7 @@ class AudioDataModule(pl.LightningDataModule):
             )
     
     def train_dataloader(self):
+        """Returns the training dataloader with [B, T] shaped tensors"""
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
@@ -186,6 +191,7 @@ class AudioDataModule(pl.LightningDataModule):
         )
     
     def val_dataloader(self):
+        """Returns the validation dataloader with [B, T] shaped tensors"""
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
@@ -197,6 +203,7 @@ class AudioDataModule(pl.LightningDataModule):
         )
     
     def test_dataloader(self):
+        """Returns the test dataloader with [B, T] shaped tensors"""
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,

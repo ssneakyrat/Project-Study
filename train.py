@@ -25,7 +25,6 @@ class EMACallback(pl.Callback):
     
     def on_fit_start(self, trainer, pl_module):
         # Initialize EMA model at the start of training
-        # Pass None for device to auto-detect from model
         self.ema = ModelEMA(pl_module, decay=self.decay, device=None)
     
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
@@ -73,7 +72,9 @@ def main(args):
         data_dir=args.data_dir,
         batch_size=config['training']['batch_size'],
         num_workers=config['training']['num_workers'],
-        **config['data']
+        sample_rate=config['data']['sample_rate'],
+        audio_length=config['data'].get('audio_length', 2.0),
+        cache_size=config['data'].get('cache_size', 100)
     )
     
     # Initialize model
@@ -112,8 +113,14 @@ def main(args):
         log_every_n_steps=10
     )
     
-    # Train model
-    trainer.fit(model, data_module)
+    # Resume from checkpoint if specified
+    if args.resume:
+        print(f"Resuming training from checkpoint: {args.resume}")
+        # Train model
+        trainer.fit(model, data_module, ckpt_path=args.resume)
+    else:
+        # Train model from scratch
+        trainer.fit(model, data_module)
     
     # Test model
     trainer.test(model, data_module)

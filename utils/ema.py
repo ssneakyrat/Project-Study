@@ -45,9 +45,13 @@ class ModelEMA:
             model (nn.Module): Model to update from
         """
         with torch.no_grad():
+            # Update all parameters
             for ema_param, param in zip(self.ema.parameters(), model.parameters()):
                 if param.is_floating_point():
                     ema_param.mul_(self.decay).add_(param.detach(), alpha=1 - self.decay)
+            
+            # Also update batch norm statistics
+            self.update_attr(model)
     
     def update_attr(self, model):
         """
@@ -57,6 +61,7 @@ class ModelEMA:
             model (nn.Module): Model to update from
         """
         for ema_module, module in zip(self.ema.modules(), model.modules()):
+            # Update batch norm running stats
             if hasattr(ema_module, 'running_mean') and hasattr(module, 'running_mean'):
                 ema_module.running_mean.mul_(self.decay).add_(
                     module.running_mean, alpha=1 - self.decay
@@ -64,3 +69,7 @@ class ModelEMA:
                 ema_module.running_var.mul_(self.decay).add_(
                     module.running_var, alpha=1 - self.decay
                 )
+                
+            # Also update num_batches_tracked if present
+            if hasattr(ema_module, 'num_batches_tracked') and hasattr(module, 'num_batches_tracked'):
+                ema_module.num_batches_tracked.copy_(module.num_batches_tracked)

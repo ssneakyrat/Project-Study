@@ -9,20 +9,20 @@ data:
   audio_length: 2.0  # in seconds
   hop_length: 256
   n_fft: 1024
-  n_mels: 80
   cache_size: 100  # Number of samples to cache in memory
 
 # Wavelet Scattering Transform parameters
 wavelet:
-  J: 6  # Increased from 2 to 6 for better frequency resolution
-  Q: 16  # Increased from 8 to 16 for higher frequency resolution
-  T: 16384  # Temporal support
+  J: 6  # Number of scales
+  Q: 16  # Number of wavelets per octave
+  T: 16384  # Temporal support (must be power of 2)
   ensure_output_dim: true
   max_order: 1  # Use only first-order scattering (simpler, more stable)
+  normalize: true
   
 # Model architecture
 model:
-  latent_dim: 512  # Increased from 256 to 512 to reduce compression ratio
+  latent_dim: 512
   channels: [24, 48, 96, 192]
   kernel_sizes: [7, 5, 5, 5]
   strides: [1, 2, 2, 2]
@@ -30,13 +30,13 @@ model:
   output_paddings: [0, 1, 1, 1]
   dropout: 0.1
   use_batch_norm: true
-  complex_repr: "mag_phase"
-  use_gradient_checkpointing: true
+  complex_repr: "mag_phase"  # Output representation mode
+  use_gradient_checkpointing: true  # Memory optimization
 
 # Training parameters
 training:
   batch_size: 16
-  accumulate_grad_batches: 16  # Increased from 4 to 16 for more stable gradients
+  accumulate_grad_batches: 16
   max_epochs: 100
   lr: 0.0003
   beta1: 0.5
@@ -52,4 +52,4 @@ loss:
   stft_weight: 1.5
   complex_loss_weight: 0.7
   spectral_convergence_weight: 0.8
-  phase_consistency_weight: 1.0  # Increased from 0.3 to 1.0 to emphasize phase
+  phase_consistency_weight: 1.0

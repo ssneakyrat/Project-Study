@@ -41,9 +41,6 @@ class WaveletScatteringTransform(nn.Module):
         # Calculate expected output shape for dimension consistency
         self.expected_output_time_dim = T // (2**J)
         
-        # Use optimal padding computation based on J
-        self.optimal_pad = 2**J
-        
         # Calculate expected number of channels (frequency bands)
         if max_order == 1:
             # For first-order: lowpass + bandpass filters
@@ -69,92 +66,48 @@ class WaveletScatteringTransform(nn.Module):
         batch_size = x.size(0)
         
         # Ensure x has correct shape [batch_size, 1, time]
-        if x.dim() == 2:
-            x = x.unsqueeze(1)
+        if x.dim() == 2:  # [B, T]
+            x = x.unsqueeze(1)  # Add channel dim -> [B, 1, T]
         elif x.dim() == 3 and x.size(1) > 1:
-            # If x has shape [batch_size, channels, time] with channels > 1
-            # we process only the first channel
+            # If x has multiple channels, only use the first one
             x = x[:, 0:1, :]
         
-        # Calculate optimal padding to ensure dimensions work with wavelet scales
-        target_length = self.T
+        # Handle input length: pad or trim to expected length T
         current_length = x.size(2)
-        
-        # Compute padding to nearest multiple of 2^J
-        pad_length = 0
-        if current_length % self.optimal_pad != 0:
-            pad_length = self.optimal_pad - (current_length % self.optimal_pad)
-        
-        # Add extra padding for consistent output dimensions
-        original_signal_padded = False
-        if current_length < target_length:
-            # Pad to target length
-            padding = target_length - current_length
-            x = F.pad(x, (0, padding + pad_length))
-            original_signal_padded = True
-        elif current_length > target_length:
-            # For longer signals, segment processing would be better
-            # but for this fix we'll truncate and note the issue
-            #print(f"Warning: Input signal length {current_length} exceeds target {target_length}.")
-            x = x[:, :, :target_length]
-            # Still apply optimal padding
-            x = F.pad(x, (0, pad_length))
-        else:
-            # Just apply optimal padding
-            x = F.pad(x, (0, pad_length))
-        
-        # Store the padding info for potential reconstruction
-        self.pad_info = {
-            'original_length': current_length,
-            'padded_length': x.size(2),
-            'target_length': target_length,
-            'was_padded': original_signal_padded
-        }
+        if current_length != self.T:
+            if current_length < self.T:
+                # Pad to target length
+                x = F.pad(x, (0, self.T - current_length))
+            else:
+                # Trim to target length
+                x = x[:, :, :self.T]
         
         # Apply scattering transform
-        x = x.contiguous()  # Ensure tensor is memory-contiguous
+        x = x.contiguous()
         Sx = self.scattering(x)
         
-        #print(f"Raw scattering output shape: {Sx.shape}")
-        
-        # Standardize format to [batch_size, channels, time]
-        if Sx.dim() == 4:
-            # Format is [batch, order, coeff, time]
-            # Reshape to [batch, order*coeff, time]
+        # Ensure output is in format [B, C, T]
+        if Sx.dim() == 4:  # Format is [batch, order, coeff, time]
             B, O, C, T = Sx.shape
             Sx = Sx.reshape(B, O*C, T)
-            #print(f"Reshaped scattering output: {Sx.shape}")
-        elif Sx.dim() == 3:
-            # Check if format is [batch, time, channels] and transpose if needed
-            if Sx.size(1) == self.expected_output_time_dim and Sx.size(2) != self.expected_output_time_dim:
+        elif Sx.dim() == 3 and Sx.size(1) != self.expected_channels:
+            # If format is [B, T, C], transpose to [B, C, T]
+            if Sx.size(2) == self.expected_channels:
                 Sx = Sx.transpose(1, 2)
-                print(f"Transposed scattering output to [B,C,T]: {Sx.shape}")
         
-        # NOW CRITICALLY IMPORTANT: Ensure output is always [B, C, T]
-        # If we detect it's in [B, T, C] format, transpose it
-        if Sx.size(2) == self.expected_channels and Sx.size(1) != self.expected_channels:
-            print(f"Detected output in [B,T,C] format, transposing to [B,C,T]")
-            Sx = Sx.transpose(1, 2)
-        
-        # Real part is the reshaped Sx, imaginary is zeros with same shape
+        # Real part is Sx, imaginary is zeros with same shape
         real_part = Sx
         imag_part = torch.zeros_like(real_part)
         
         # Normalize if requested
         if self.normalize:
-            # Compute per-channel normalization for better stability
+            # Compute per-channel normalization
             mean_value = torch.mean(torch.abs(real_part), dim=2, keepdim=True)
-            std_value = torch.std(real_part, dim=2, keepdim=True) + 1e-6
+            std_value = torch.std(real_part, dim=2, keepdim=True) + self.eps
             
-            # Simple standardization for numerical stability
+            # Apply normalization
             real_part = (real_part - mean_value) / std_value * 0.1
-            imag_part = imag_part / (std_value + self.eps) * 0.1
-        
-        # Print final dimensions for debugging
-        #print(f"Final WST output - Real: {real_part.shape}, Imag: {imag_part.shape}")
-        
-        # Verify shape is correct before returning
-        assert real_part.size(1) != self.expected_output_time_dim, "WST output has incorrect dimension format!"
+            imag_part = imag_part / std_value * 0.1
         
         return (real_part, imag_part)
 
@@ -230,7 +183,7 @@ class ParametricWaveletTransform(nn.Module):
         Returns:
             tuple: Complex coefficients as (real, imag)
         """
-        # Ensure correct shape
+        # Ensure correct shape [B, 1, T]
         if x.dim() == 2:
             x = x.unsqueeze(1)
         
@@ -246,21 +199,7 @@ class ParametricWaveletTransform(nn.Module):
         # Apply filters
         output = self.conv(x)
         
-        # Ensure consistent output dimensions if flag is set
-        if self.ensure_output_dim:
-            T_out = output.size(2)
-            if T_out != self.expected_output_time_dim:
-                if T_out > self.expected_output_time_dim:
-                    # Trim output
-                    output = output[:, :, :self.expected_output_time_dim]
-                else:
-                    # Pad output
-                    pad_size = self.expected_output_time_dim - T_out
-                    output = F.pad(output, (0, pad_size))
-        
         # Split into real and imaginary (approximation)
-        # In a real implementation, we would use Hilbert transform 
-        # or other techniques to get the imaginary part
         real = output
         imag = torch.zeros_like(real)
         

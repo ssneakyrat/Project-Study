@@ -37,15 +37,13 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
             Q=config['wavelet']['Q'],
             T=config['wavelet']['T'],
             sample_rate=config['data']['sample_rate'],
-            normalize=True,
-            max_order=config['wavelet'].get('max_order', 1),  # Use simpler first-order coefficients
+            normalize=config['wavelet'].get('normalize', True),
+            max_order=config['wavelet'].get('max_order', 1),
             ensure_output_dim=config['wavelet'].get('ensure_output_dim', True)
         )
         
-        # Calculate input channels more reliably
-        # In Kymatio, first-order scattering gives J*Q coefficients plus 1 lowpass
+        # Calculate input channels based on wavelet parameters
         J, Q = config['wavelet']['J'], config['wavelet']['Q']
-        
         if config['wavelet'].get('max_order', 1) == 1:
             # For first-order: lowpass + bandpass filters
             input_channels = 1 + J * Q
@@ -114,7 +112,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
     
     def forward(self, x):
         """
-        Forward pass through the model with consistent dimension handling
+        Forward pass through the model
         
         Args:
             x (Tensor): Input audio [B, T]
@@ -122,81 +120,28 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         Returns:
             Tensor: Reconstructed audio [B, T]
         """
-        # Ensure input has correct shape
-        if x.dim() == 1:  # Single audio sample without batch dimension
-            x = x.unsqueeze(0)  # Add batch dimension
-        
-        # Store original shape for output reshaping
+        # Store original batch size and length
         batch_size = x.size(0)
         original_length = x.size(-1)
-        original_dim = x.dim()  # Store original dimensionality
         
-        # Ensure the input has the right length for wavelet transform
-        target_length = self.config['wavelet']['T']
-        if x.size(-1) != target_length:
-            if x.size(-1) < target_length:
-                # Simply pad to target length
-                padding = target_length - x.size(-1)
-                x = F.pad(x, (0, padding))
-            else:
-                # Trim to target length
-                x = x[..., :target_length]
-        
-        # Apply wavelet scattering transform - SHOULD RETURN [B, C, T] FORMAT
+        # Apply wavelet scattering transform - returns [B, C, T] format
         wst_output = self.wst(x)
         
-        # Print output shape for debugging
-        if isinstance(wst_output, tuple):
-            real, imag = wst_output
-            #print(f"WST output dimensions: Real {real.shape}, Imag {imag.shape}")
-            
-            # ENSURE WST OUTPUT IS IN [B, C, T] FORMAT
-            # Get expected input channels for first encoder layer
-            expected_channels = self.encoder.layers[0][0].in_channels
-            
-            # 1. Check if dimensions are swapped [B, T, C] and fix if needed
-            if real.size(2) == expected_channels and real.size(1) != expected_channels:
-                print(f"Transposing WST output from [B, T, C] to [B, C, T]")
-                real = real.transpose(1, 2)
-                imag = imag.transpose(1, 2)
-            
-            # 2. Adapt channels if needed using a channel projection
-            if real.size(1) != expected_channels:
-                #print(f"Creating channel projection from {real.size(1)} to {expected_channels}")
-                
-                # Create a channel projection (1x1 convolution)
-                channel_proj = nn.Conv1d(
-                    real.size(1), expected_channels, kernel_size=1, 
-                    bias=False, device=real.device
-                )
-                
-                # Initialize projection with reasonable weights (better than zeros)
-                nn.init.kaiming_uniform_(channel_proj.weight)
-                
-                # Apply projection to both real and imaginary parts
-                real = channel_proj(real)
-                imag = channel_proj(imag)
-                
-                #print(f"WST output after adaptation: Real {real.shape}, Imag {real.shape}")
-            
-            # Update wst_output with properly shaped tensors
-            wst_output = (real, imag)
-        
-        # Pass through encoder - EXPECTS [B, C, T] FORMAT
+        # Pass through encoder - expects [B, C, T] format
         encoded, intermediates = self.encoder(wst_output)
         
-        # Pass through decoder with skip connections - SHOULD MAINTAIN [B, C, T] FORMAT
+        # Pass through decoder with skip connections
         decoded = self.decoder(encoded, intermediates)
         
         # Convert complex output to real
         output = self.to_real(decoded)
         
-        # Reshape output to match temporal dimension of original audio
+        # Reshape output to match original audio length if needed
         if output.size(-1) != original_length:
-            # Simple solution: use interpolation to match original length
-            if output.dim() == 2:
-                output = output.unsqueeze(1)
-            
+            # Use interpolation to match original length
+            if output.dim() == 2:  # If [B, T]
+                output = output.unsqueeze(1)  # Add channel dim -> [B, 1, T]
+                
             output = F.interpolate(
                 output, 
                 size=original_length,
@@ -204,8 +149,8 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
                 align_corners=False
             )
             
-            if original_dim == 2 and output.dim() == 3:
-                output = output.squeeze(1)
+            if output.dim() == 3 and output.size(1) == 1:
+                output = output.squeeze(1)  # Remove channel dim -> [B, T]
         
         # Check for NaN or Inf values
         if torch.isnan(output).any() or torch.isinf(output).any():
@@ -238,7 +183,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         """
-        Training step with enhanced phase consistency loss
+        Training step
         
         Args:
             batch (Tensor): Batch of audio samples [B, T]
@@ -259,7 +204,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         # Wavelet loss
         wst_loss = self.wavelet_loss(x_hat, x)
         
-        # Calculate multi-resolution phase consistency loss with enhanced weights
+        # Calculate multi-resolution phase consistency loss
         phase_consistency_loss = 0.0
         for n_fft, hop_length in zip([512, 1024, 2048], [128, 256, 512]):
             window = torch.hann_window(n_fft).to(x.device)
@@ -275,18 +220,16 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
             
             # Weight phase difference by magnitude to focus on high-energy regions
             phase_diff = torch.abs(torch.remainder(x_phase - x_hat_phase + np.pi, 2 * np.pi) - np.pi)
-            # Normalized magnitude weighting with higher emphasis
-            mag_weight = (x_mag / (torch.mean(x_mag) + 1e-8)) ** 2  # Square for higher emphasis
+            mag_weight = (x_mag / (torch.mean(x_mag) + 1e-8)) ** 2
             
             # Weighted phase consistency (1 - cos(Δφ))
-            # This creates smoother gradients than direct phase difference
             weighted_phase_loss = torch.mean(mag_weight * (1 - torch.cos(phase_diff)))
             phase_consistency_loss += weighted_phase_loss
         
         # Average across all resolutions
         phase_consistency_loss /= 3.0
         
-        # Combined loss with enhanced phase component
+        # Combined loss
         loss = (
             self.l1_weight * l1_loss +
             self.stft_weight * tf_loss +
@@ -314,7 +257,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         """
-        Validation step with enhanced phase consistency loss
+        Validation step
         
         Args:
             batch (Tensor): Batch of audio samples [B, T]
@@ -326,13 +269,6 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         # Forward pass
         x = batch
         x_hat = self(x)
-        
-        # Ensure shape matching for metrics calculation
-        if x_hat.dim() != x.dim():
-            if x_hat.dim() == 3 and x.dim() == 2:
-                x_hat = x_hat.squeeze(1)
-            elif x_hat.dim() == 2 and x.dim() == 3:
-                x_hat = x_hat.unsqueeze(1)
         
         # Ensure shapes match for metrics calculation
         if x_hat.shape != x.shape:
@@ -346,7 +282,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         complex_loss, mag_loss, phase_loss = self.stft_loss(x_hat, x)
         tf_loss, time_loss, freq_loss = self.time_freq_loss(x_hat, x)
         
-        # Calculate multi-resolution phase consistency loss with enhanced weights
+        # Calculate phase consistency loss (same as training)
         phase_consistency_loss = 0.0
         for n_fft, hop_length in zip([512, 1024, 2048], [128, 256, 512]):
             window = torch.hann_window(n_fft).to(x.device)
@@ -360,19 +296,18 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
             x_hat_phase = torch.angle(x_hat_stft)
             x_mag = torch.abs(x_stft)
             
-            # Weight phase difference by magnitude to focus on high-energy regions
+            # Weight phase difference by magnitude
             phase_diff = torch.abs(torch.remainder(x_phase - x_hat_phase + np.pi, 2 * np.pi) - np.pi)
-            # Normalized magnitude weighting with higher emphasis
-            mag_weight = (x_mag / (torch.mean(x_mag) + 1e-8)) ** 2  # Square for higher emphasis
+            mag_weight = (x_mag / (torch.mean(x_mag) + 1e-8)) ** 2
             
-            # Weighted phase consistency (1 - cos(Δφ))
+            # Weighted phase consistency
             weighted_phase_loss = torch.mean(mag_weight * (1 - torch.cos(phase_diff)))
             phase_consistency_loss += weighted_phase_loss
         
         # Average across all resolutions
         phase_consistency_loss /= 3.0
         
-        # Combined loss with enhanced phase component
+        # Combined loss
         loss = (
             self.l1_weight * l1_loss +
             self.stft_weight * tf_loss +
@@ -428,13 +363,6 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         # Forward pass
         x = batch
         x_hat = self(x)
-        
-        # Ensure shape matching for metrics calculation
-        if x_hat.dim() != x.dim():
-            if x_hat.dim() == 3 and x.dim() == 2:
-                x_hat = x_hat.squeeze(1)
-            elif x_hat.dim() == 2 and x.dim() == 3:
-                x_hat = x_hat.unsqueeze(1)
         
         # Ensure shapes match for metrics calculation
         if x_hat.shape != x.shape:
@@ -546,10 +474,6 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
             
             # Convert to magnitude in dB
             mag = torch.log10(torch.abs(stft) + 1e-8)
-            
-            # Ensure result is on CPU as numpy
-            if mag.is_cuda:
-                mag = mag.cpu()
             
             return mag
         except Exception as e:
