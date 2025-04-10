@@ -38,15 +38,6 @@ class ComplexConv1d(nn.Module):
         self.dilation = dilation
         
     def forward(self, x):
-        """
-        Forward pass
-        
-        Args:
-            x (tuple): Tuple of (real, imag) tensors or ComplexTensor
-            
-        Returns:
-            tuple: Tuple of (real, imag) tensors
-        """
         if isinstance(x, ComplexTensor):
             x_real, x_imag = x.real, x.imag
         elif isinstance(x, tuple):
@@ -54,15 +45,20 @@ class ComplexConv1d(nn.Module):
         else:  # Handle the case where input is real
             x_real, x_imag = x, torch.zeros_like(x)
         
-        # FIX: Check and transpose dimensions if needed
-        if x_real.size(1) > x_real.size(2):  # If time dimension (1) > channel dimension (2)
-            x_real = x_real.transpose(1, 2)
-            x_imag = x_imag.transpose(1, 2)
-
-        # Real component: (W_re * x_re - W_im * x_im)
-        real = self.conv_re(x_real) - self.conv_im(x_imag)
+        # FIX: Remove extra dimension if present
+        if x_real.dim() == 4:
+            x_real = x_real.squeeze(2)
+            x_imag = x_imag.squeeze(2)
         
-        # Imaginary component: (W_re * x_im + W_im * x_re)
+        # FIX: Check and transpose dimensions if needed - use more reliable condition
+        if x_real.size(1) > x_real.size(-1) or x_real.dim() > 3:
+            print(f"Warning: Unusual tensor shape for Conv1d: {x_real.shape}, correcting...")
+            if x_real.dim() == 3:
+                x_real = x_real.transpose(1, 2)
+                x_imag = x_imag.transpose(1, 2)
+
+        # Regular convolution operations
+        real = self.conv_re(x_real) - self.conv_im(x_imag)
         imag = self.conv_re(x_imag) + self.conv_im(x_real)
         
         return (real, imag)

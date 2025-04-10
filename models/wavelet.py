@@ -106,19 +106,6 @@ class WaveletScatteringTransform(nn.Module):
         
         # Check the shape for debugging
         print(f"After normalization - Real: {real_part.shape}, Imag: {imag_part.shape}")
-        
-        # FIX FOR DIMENSIONAL ROTATION
-        # Check if time dimension is larger than channel dimension
-        if real_part.size(1) < real_part.size(2):
-            print(f"Applying dimension transpose: {real_part.shape} -> ", end="")
-            real_part = real_part.transpose(1, 2)
-            imag_part = imag_part.transpose(1, 2)
-            print(f"{real_part.shape}")
-        
-        # Fix: Remove extra dimension before returning
-        if real_part.dim() == 4:  # If we have [B, C, 1, T]
-            real_part = real_part.squeeze(2)
-            imag_part = imag_part.squeeze(2)
 
         # Print final shape for debugging
         print(f"Final WST output - Real: {real_part.shape}, Imag: {imag_part.shape}")

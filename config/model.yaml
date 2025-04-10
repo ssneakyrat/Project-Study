@@ -14,7 +14,7 @@ data:
 
 # Wavelet Scattering Transform parameters
 wavelet:
-  J: 3  # Changed from 1 to 3 for better frequency resolution
+  J: 1  # Changed from 1 to 3 for better frequency resolution
   Q: 12  # Increased frequency resolution
   T: 8192  # Temporal support of the lowpass filter
   ensure_output_dim: true
