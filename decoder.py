@@ -39,20 +39,34 @@ class ComplexDecoder(nn.Module):
         
         # Apply layers with skip connections
         for i, layer in enumerate(self.layers):
-            # Concatenate with encoder features along channel dimension
-            x = torch.cat([x, encoder_features[i]], dim=1)
+            # For complex tensors, concatenate along channel dimension 
+            if isinstance(x, ComplexTensor) and isinstance(encoder_features[i], ComplexTensor):
+                # Create a new ComplexTensor with concatenated real and imaginary parts
+                x_real = torch.cat([x.real, encoder_features[i].real], dim=1)
+                x_imag = torch.cat([x.imag, encoder_features[i].imag], dim=1)
+                x = ComplexTensor(x_real, x_imag)
+            else:
+                # Fallback for regular tensors
+                x = torch.cat([x, encoder_features[i]], dim=1)
+                
             x = layer(x)
             x = complex_leaky_relu(x)
         
         # Final output layer
-        x = torch.cat([x, encoder_features[-1]], dim=1)
+        if isinstance(x, ComplexTensor) and isinstance(encoder_features[-1], ComplexTensor):
+            x_real = torch.cat([x.real, encoder_features[-1].real], dim=1)
+            x_imag = torch.cat([x.imag, encoder_features[-1].imag], dim=1)
+            x = ComplexTensor(x_real, x_imag)
+        else:
+            x = torch.cat([x, encoder_features[-1]], dim=1)
+            
         x = self.output_layer(x)
         
         # Convert complex to real for final output
-        output = complex_to_real(x)
-        
-        # Double-check output is a regular Tensor, not a ComplexTensor
-        if isinstance(output, ComplexTensor):
-            output = torch.sqrt(output.real**2 + output.imag**2)
+        if isinstance(x, ComplexTensor):
+            # Explicit conversion to magnitude
+            output = torch.sqrt(x.real**2 + x.imag**2)
+        else:
+            output = x
         
         return output
