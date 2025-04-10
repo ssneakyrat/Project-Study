@@ -14,15 +14,15 @@ data:
 
 # Wavelet Scattering Transform parameters
 wavelet:
-  J: 2  # Scale parameter (smaller = less compression, better temporal resolution)
-  Q: 8  # Frequency resolution (smaller = simpler, more stable)
+  J: 6  # Increased from 2 to 6 for better frequency resolution
+  Q: 16  # Increased from 8 to 16 for higher frequency resolution
   T: 16384  # Temporal support
   ensure_output_dim: true
   max_order: 1  # Use only first-order scattering (simpler, more stable)
   
 # Model architecture
 model:
-  latent_dim: 256
+  latent_dim: 512  # Increased from 256 to 512 to reduce compression ratio
   channels: [32, 64, 128, 256]
   kernel_sizes: [7, 5, 5, 5]
   strides: [1, 2, 2, 2]
@@ -36,7 +36,7 @@ model:
 # Training parameters
 training:
   batch_size: 8
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 16  # Increased from 4 to 16 for more stable gradients
   max_epochs: 100
   lr: 0.0003
   beta1: 0.5
@@ -52,4 +52,4 @@ loss:
   stft_weight: 1.5
   complex_loss_weight: 0.7
   spectral_convergence_weight: 0.8
-  phase_consistency_weight: 0.3
+  phase_consistency_weight: 1.0  # Increased from 0.3 to 1.0 to emphasize phase

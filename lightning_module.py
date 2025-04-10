@@ -150,33 +150,35 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
             real, imag = wst_output
             print(f"WST output before adaptation: Real {real.shape}, Imag {imag.shape}")
             
-            # IMPORTANT: Adapt WST output to encoder's expected channels
-            num_channels = self.encoder.input_channels
+            # Get expected input channels for first encoder layer
+            expected_channels = self.encoder.layers[0][0].in_channels
+            
+            # Adapt WST output to encoder's expected channels with a proper channel projection
+            if real.size(1) != expected_channels:
+                print(f"Creating channel projection from {real.size(1)} to {expected_channels}")
+                
+                # Create a channel projection (1x1 convolution)
+                channel_proj = nn.Conv1d(
+                    real.size(1), expected_channels, kernel_size=1, 
+                    bias=False, device=real.device
+                )
+                
+                # Initialize projection with reasonable weights (better than zeros)
+                nn.init.kaiming_uniform_(channel_proj.weight)
+                
+                # Apply projection to both real and imaginary parts
+                real = channel_proj(real)
+                imag = channel_proj(imag)
+                
+                print(f"WST output after adaptation: Real {real.shape}, Imag {imag.shape}")
+                wst_output = (real, imag)
             
             # If dimensions need to be transposed
             if real.size(1) > real.size(2) * 2:  # Simple heuristic to detect wrong order
                 print("Transposing WST output dimensions...")
                 real = real.transpose(1, 2)
                 imag = imag.transpose(1, 2)
-            
-            # Handle channel count mismatch
-            if real.size(1) != num_channels:
-                print(f"Adapting channel count from {real.size(1)} to {num_channels}")
-                
-                # Create adapted tensors regardless of whether we need more or fewer channels
-                adapted_real = torch.zeros(real.size(0), num_channels, real.size(2), device=real.device)
-                adapted_imag = torch.zeros(imag.size(0), num_channels, imag.size(2), device=imag.device)
-                
-                # Copy as many channels as we can (either truncating or partially filling)
-                copy_channels = min(real.size(1), num_channels)
-                adapted_real[:, :copy_channels] = real[:, :copy_channels]
-                adapted_imag[:, :copy_channels] = imag[:, :copy_channels]
-                
-                real = adapted_real
-                imag = adapted_imag
-                
-            print(f"WST output after adaptation: Real {real.shape}, Imag {imag.shape}")
-            wst_output = (real, imag)
+                wst_output = (real, imag)
         
         # Pass through encoder
         encoded, intermediates = self.encoder(wst_output)
@@ -255,7 +257,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         # Wavelet loss
         wst_loss = self.wavelet_loss(x_hat, x)
         
-        # Calculate multi-resolution phase consistency loss
+        # Calculate multi-resolution phase consistency loss with enhanced weights
         phase_consistency_loss = 0.0
         for n_fft, hop_length in zip([512, 1024, 2048], [128, 256, 512]):
             window = torch.hann_window(n_fft).to(x.device)
@@ -271,8 +273,8 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
             
             # Weight phase difference by magnitude to focus on high-energy regions
             phase_diff = torch.abs(torch.remainder(x_phase - x_hat_phase + np.pi, 2 * np.pi) - np.pi)
-            # Normalized magnitude weighting
-            mag_weight = x_mag / (torch.mean(x_mag) + 1e-8)
+            # Normalized magnitude weighting with higher emphasis
+            mag_weight = (x_mag / (torch.mean(x_mag) + 1e-8)) ** 2  # Square for higher emphasis
             
             # Weighted phase consistency (1 - cos(Δφ))
             # This creates smoother gradients than direct phase difference
@@ -310,7 +312,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         """
-        Validation step with added phase consistency loss
+        Validation step with enhanced phase consistency loss
         
         Args:
             batch (Tensor): Batch of audio samples [B, T]
@@ -342,32 +344,38 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         complex_loss, mag_loss, phase_loss = self.stft_loss(x_hat, x)
         tf_loss, time_loss, freq_loss = self.time_freq_loss(x_hat, x)
         
-        # Add phase consistency loss (same as in training)
-        n_fft = 1024
-        hop_length = 256
-        window = torch.hann_window(n_fft).to(x.device)
+        # Calculate multi-resolution phase consistency loss with enhanced weights
+        phase_consistency_loss = 0.0
+        for n_fft, hop_length in zip([512, 1024, 2048], [128, 256, 512]):
+            window = torch.hann_window(n_fft).to(x.device)
+            
+            # Compute complex STFT
+            x_stft = torch.stft(x, n_fft, hop_length, window=window, return_complex=True)
+            x_hat_stft = torch.stft(x_hat, n_fft, hop_length, window=window, return_complex=True)
+            
+            # Extract phase and magnitude information
+            x_phase = torch.angle(x_stft)
+            x_hat_phase = torch.angle(x_hat_stft)
+            x_mag = torch.abs(x_stft)
+            
+            # Weight phase difference by magnitude to focus on high-energy regions
+            phase_diff = torch.abs(torch.remainder(x_phase - x_hat_phase + np.pi, 2 * np.pi) - np.pi)
+            # Normalized magnitude weighting with higher emphasis
+            mag_weight = (x_mag / (torch.mean(x_mag) + 1e-8)) ** 2  # Square for higher emphasis
+            
+            # Weighted phase consistency (1 - cos(Δφ))
+            weighted_phase_loss = torch.mean(mag_weight * (1 - torch.cos(phase_diff)))
+            phase_consistency_loss += weighted_phase_loss
         
-        # Compute complex STFT
-        x_stft = torch.stft(x, n_fft, hop_length, window=window, return_complex=True)
-        x_hat_stft = torch.stft(x_hat, n_fft, hop_length, window=window, return_complex=True)
+        # Average across all resolutions
+        phase_consistency_loss /= 3.0
         
-        # Extract phase information
-        x_phase = torch.angle(x_stft)
-        x_hat_phase = torch.angle(x_hat_stft)
-        
-        # Compute phase consistency loss
-        phase_diff = x_phase - x_hat_phase
-        phase_consistency_loss = torch.mean(1 - torch.cos(phase_diff))
-        
-        # Weight the phase consistency loss
-        phase_consistency_weight = 0.3
-        
-        # Combined loss
+        # Combined loss with enhanced phase component
         loss = (
             self.l1_weight * l1_loss +
             self.stft_weight * tf_loss +
             self.complex_loss_weight * complex_loss +
-            phase_consistency_weight * phase_consistency_loss
+            self.phase_consistency_weight * phase_consistency_loss
         )
         
         # Compute metrics

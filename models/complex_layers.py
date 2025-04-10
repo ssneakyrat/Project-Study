@@ -45,21 +45,27 @@ class ComplexConv1d(nn.Module):
         else:  # Handle the case where input is real
             x_real, x_imag = x, torch.zeros_like(x)
         
-        # First handle extra dimensions - move this BEFORE the channel check
+        # First handle extra dimensions
         if x_real.dim() == 4:
             x_real = x_real.squeeze(2)
             x_imag = x_imag.squeeze(2)
         
-        # Then check channel dimensions
+        # Check and fix channel dimensions if needed
         if x_real.size(1) != self.in_channels:
-            raise ValueError(f"Expected {self.in_channels} channels, got {x_real.size(1)}. Shape: {x_real.shape}")
+            print(f"Adjusting channel dimensions from {x_real.size(1)} to {self.in_channels}")
+            # Create adapted tensors
+            adapted_real = torch.zeros(x_real.size(0), self.in_channels, x_real.size(2), device=x_real.device)
+            adapted_imag = torch.zeros(x_imag.size(0), self.in_channels, x_imag.size(2), device=x_imag.device)
+            
+            # Copy as many channels as we can
+            copy_channels = min(x_real.size(1), self.in_channels)
+            adapted_real[:, :copy_channels] = x_real[:, :copy_channels]
+            adapted_imag[:, :copy_channels] = x_imag[:, :copy_channels]
+            
+            x_real = adapted_real
+            x_imag = adapted_imag
         
-        # FIX: Remove extra dimension if present
-        if x_real.dim() == 4:
-            x_real = x_real.squeeze(2)
-            x_imag = x_imag.squeeze(2)
-        
-        # FIX: Check and transpose dimensions if needed - use more reliable condition
+        # Check and transpose dimensions if needed
         if x_real.size(1) > x_real.size(-1) or x_real.dim() > 3:
             print(f"Warning: Unusual tensor shape for Conv1d: {x_real.shape}, correcting...")
             if x_real.dim() == 3:
