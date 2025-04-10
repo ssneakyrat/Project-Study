@@ -41,6 +41,22 @@ class ComplexConvTranspose1d(nn.Module):
         
         return ComplexTensor(real_part, imag_part)
 
+class ComplexLayerNorm(nn.Module):
+    def __init__(self, normalized_shape):
+        super().__init__()
+        self.norm_real = nn.LayerNorm(normalized_shape)
+        self.norm_imag = nn.LayerNorm(normalized_shape)
+        
+    def forward(self, x):
+        """Apply layer normalization to real and imaginary parts separately"""
+        if not isinstance(x, ComplexTensor):
+            return self.norm_real(x)
+            
+        real_part = self.norm_real(x.real)
+        imag_part = self.norm_imag(x.imag)
+        
+        return ComplexTensor(real_part, imag_part)
+
 def complex_leaky_relu(x, negative_slope=0.2):
     """
     Apply Leaky ReLU to real and imaginary parts separately

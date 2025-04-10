@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from complextensor import ComplexTensor
-from complex_ops import ComplexConv1d, complex_leaky_relu
+from complex_ops import ComplexConv1d, complex_leaky_relu, ComplexLayerNorm
 
 class ComplexEncoder(nn.Module):
     def __init__(self, input_channels, hidden_dims=[64, 128, 256]):
@@ -12,7 +12,7 @@ class ComplexEncoder(nn.Module):
         self.layers.append(
             nn.Sequential(
                 ComplexConv1d(input_channels, hidden_dims[0], kernel_size=7, stride=2, padding=3),
-                nn.LayerNorm([hidden_dims[0]]),
+                ComplexLayerNorm([hidden_dims[0]]),
             )
         )
         
@@ -21,7 +21,7 @@ class ComplexEncoder(nn.Module):
             self.layers.append(
                 nn.Sequential(
                     ComplexConv1d(hidden_dims[i], hidden_dims[i+1], kernel_size=5, stride=2, padding=2),
-                    nn.LayerNorm([hidden_dims[i+1]]),
+                    ComplexLayerNorm([hidden_dims[i+1]]),
                 )
             )
     

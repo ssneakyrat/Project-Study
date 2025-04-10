@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from complextensor import ComplexTensor
-from complex_ops import ComplexConvTranspose1d, complex_leaky_relu, complex_to_real
+from complex_ops import ComplexConvTranspose1d, complex_leaky_relu, complex_to_real, ComplexLayerNorm
 
 class ComplexDecoder(nn.Module):
     def __init__(self, latent_dim, hidden_dims=[256, 128, 64], output_channels=1):
@@ -17,7 +17,7 @@ class ComplexDecoder(nn.Module):
                 nn.Sequential(
                     ComplexConvTranspose1d(hidden_dims[i] * 2, hidden_dims[i+1], 
                                           kernel_size=5, stride=2, padding=2),
-                    nn.LayerNorm([hidden_dims[i+1]]),
+                    ComplexLayerNorm([hidden_dims[i+1]]),
                 )
             )
         

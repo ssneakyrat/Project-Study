@@ -59,7 +59,13 @@ def test_wavelet_transform():
     
     # Visualize (optional)
     plt.figure(figsize=(10, 6))
-    plt.imshow(Sx[0].detach().cpu().numpy(), aspect='auto', origin='lower')
+    # Flatten the higher dimensions for visualization
+    if Sx.dim() > 3:
+        # If we have a 4D tensor, take first channel of 2nd dimension
+        plt.imshow(Sx[0, 0].detach().cpu().numpy(), aspect='auto', origin='lower')
+    else:
+        # For 3D tensor, average across channels
+        plt.imshow(Sx[0].mean(dim=0).detach().cpu().numpy(), aspect='auto', origin='lower')
     plt.colorbar()
     plt.title('Wavelet Scattering Coefficients')
     plt.savefig('wavelet_output.png')

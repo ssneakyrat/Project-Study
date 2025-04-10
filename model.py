@@ -28,8 +28,11 @@ class WaveletAEModel(LightningModule):
             wavelet_output = self.wavelet(dummy_input)
         wavelet_channels = wavelet_output.shape[1]
         
+        # Ensure even channel dimension for complex tensor conversion
+        self.input_channels = wavelet_channels // 2
+        
         # Encoder and decoder
-        self.encoder = ComplexEncoder(wavelet_channels, encoder_dims)
+        self.encoder = ComplexEncoder(self.input_channels, encoder_dims)
         self.decoder = ComplexDecoder(encoder_dims[-1], encoder_dims, output_channels=1)
         
         # Loss function
@@ -47,8 +50,15 @@ class WaveletAEModel(LightningModule):
         # Apply wavelet transform
         x_wavelet = self.wavelet(x)
         
-        # Make complex by splitting channels
+        # Ensure even number of channels for complex tensor
         n_channels = x_wavelet.shape[1]
+        if n_channels % 2 != 0:
+            # If odd number, pad with zeros to make even
+            pad = torch.zeros_like(x_wavelet[:, :1])
+            x_wavelet = torch.cat([x_wavelet, pad], dim=1)
+            n_channels += 1
+        
+        # Make complex by splitting channels
         half_channels = n_channels // 2
         x_complex = ComplexTensor(
             x_wavelet[:, :half_channels], 
