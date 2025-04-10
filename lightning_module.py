@@ -52,6 +52,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
                     input_channels = wst_output[0].shape[1]  # Real part channels
                 else:
                     input_channels = wst_output.shape[1]  # All channels
+            print(f"Initializing encoder with {input_channels} input channels")
         except Exception as e:
             print(f"Warning: Error determining WST output shape: {e}")
             # Fallback to an estimate based on configuration
