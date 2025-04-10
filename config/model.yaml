@@ -14,38 +14,42 @@ data:
 
 # Wavelet Scattering Transform parameters
 wavelet:
-  J: 1  # Changed from 1 to 3 for better frequency resolution
-  Q: 12  # Increased frequency resolution
-  T: 8192  # Temporal support of the lowpass filter
+  J: 2  # Scale parameter (smaller = less compression, better temporal resolution)
+  Q: 8  # Frequency resolution (smaller = simpler, more stable)
+  T: 16384  # Temporal support
   ensure_output_dim: true
+  max_order: 1  # Use only first-order scattering (simpler, more stable)
   
 # Model architecture
 model:
   latent_dim: 256
   channels: [32, 64, 128, 256]
-  kernel_sizes: [5, 5, 5, 5]
-  strides: [2, 2, 2, 2]  # Back to standard strides
-  paddings: [2, 2, 2, 2]
-  output_paddings: [1, 1, 1, 1]  # Updated for standard strides
+  kernel_sizes: [7, 5, 5, 5]
+  strides: [1, 2, 2, 2]
+  paddings: [3, 2, 2, 2]
+  output_paddings: [0, 1, 1, 1]
   dropout: 0.1
   use_batch_norm: true
-  complex_repr: "rectangular"
+  complex_repr: "mag_phase"
+  use_gradient_checkpointing: true
 
 # Training parameters
 training:
-  batch_size: 16
-  accumulate_grad_batches: 2
+  batch_size: 8
+  accumulate_grad_batches: 4
   max_epochs: 100
-  lr: 0.0002
+  lr: 0.0003
   beta1: 0.5
   beta2: 0.999
-  scheduler_gamma: 0.95
+  scheduler_gamma: 0.97
   num_workers: 4
   precision: 16-mixed
+  gradient_clip_val: 1.0
 
 # Loss weights
 loss:
   l1_weight: 1.0
-  stft_weight: 1.0
-  complex_loss_weight: 0.5  # Increased from 0.25 to 0.5 to emphasize phase
-  spectral_convergence_weight: 0.5
+  stft_weight: 1.5
+  complex_loss_weight: 0.7
+  spectral_convergence_weight: 0.8
+  phase_consistency_weight: 0.3

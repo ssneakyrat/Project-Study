@@ -9,9 +9,9 @@ from kymatio.torch import Scattering1D
 
 
 class WaveletScatteringTransform(nn.Module):
-    def __init__(self, J, Q, T, sample_rate, normalize=True, max_order=2, ensure_output_dim=True):
+    def __init__(self, J, Q, T, sample_rate, normalize=True, max_order=1, ensure_output_dim=True):
         """
-        Wavelet Scattering Transform module
+        Wavelet Scattering Transform module with improved dimension handling
         
         Args:
             J (int): Number of scales
@@ -41,9 +41,12 @@ class WaveletScatteringTransform(nn.Module):
         # Calculate expected output shape for dimension consistency
         self.expected_output_time_dim = T // (2**J)
         
+        # Use optimal padding computation based on J
+        self.optimal_pad = 2**J
+        
     def forward(self, x):
         """
-        Apply wavelet scattering transform to input audio
+        Apply wavelet scattering transform to input audio with simplified dimension handling
         
         Args:
             x (Tensor): Input audio of shape [batch_size, time] or [batch_size, 1, time]
@@ -62,59 +65,84 @@ class WaveletScatteringTransform(nn.Module):
             # we process only the first channel
             x = x[:, 0:1, :]
         
-        # Ensure correct time dimension by padding or truncating
+        # Calculate optimal padding to ensure dimensions work with wavelet scales
         target_length = self.T
         current_length = x.size(2)
         
+        # Compute padding to nearest multiple of 2^J
+        pad_length = 0
+        if current_length % self.optimal_pad != 0:
+            pad_length = self.optimal_pad - (current_length % self.optimal_pad)
+        
+        # Add extra padding for consistent output dimensions
+        original_signal_padded = False
         if current_length < target_length:
-            # Pad
+            # Pad to target length
             padding = target_length - current_length
-            x = F.pad(x, (0, padding))
+            x = F.pad(x, (0, padding + pad_length))
+            original_signal_padded = True
         elif current_length > target_length:
-            # Truncate
+            # For longer signals, segment processing would be better
+            # but for this fix we'll truncate and note the issue
+            print(f"Warning: Input signal length {current_length} exceeds target {target_length}.")
             x = x[:, :, :target_length]
+            # Still apply optimal padding
+            x = F.pad(x, (0, pad_length))
+        else:
+            # Just apply optimal padding
+            x = F.pad(x, (0, pad_length))
+        
+        # Store the padding info for potential reconstruction
+        self.pad_info = {
+            'original_length': current_length,
+            'padded_length': x.size(2),
+            'target_length': target_length,
+            'was_padded': original_signal_padded
+        }
+        
+        print(f"WST input after padding: {x.shape}")
         
         # Apply scattering transform
         x = x.contiguous()  # Ensure tensor is memory-contiguous
         Sx = self.scattering(x)
         
-        # Print dimensions for debugging
         print(f"Raw scattering output shape: {Sx.shape}")
         
-        # Two approaches depending on how Kymatio packs the data:
-        # 1. If real and imaginary parts are in separate channels
-        if hasattr(self.scattering, 'output_format') and self.scattering.output_format == 'array':
-            # Split channels evenly (assuming first half are real, second half imaginary)
-            C = Sx.size(1)
-            C_half = C // 2
-            real_part = Sx[:, :C_half, :]
-            imag_part = Sx[:, C_half:, :]
-        else:
-            # 2. If real and imaginary parts are interleaved in the output
-            # Fallback to just using the output directly as real part
+        # SIMPLIFIED APPROACH: Handle different output formats more robustly
+        # Reshape to [batch, channels, time] without complex reshaping logic
+        
+        if Sx.dim() == 4:
+            # Format is [batch, order, coeff, time]
+            
+            # SIMPLE FIX: Just flatten the middle two dimensions
+            # This avoids complex channel extraction logic that might break
+            B, O, C, T = Sx.shape
+            Sx = Sx.reshape(B, O*C, T)
+            print(f"Reshaped scattering output: {Sx.shape}")
+            
+            # Real part is the reshaped Sx, imaginary is zeros with same shape
             real_part = Sx
-            imag_part = torch.zeros_like(real_part)  # Default to zero imaginary part
+            imag_part = torch.zeros_like(real_part)
+        else:
+            # Standard format
+            real_part = Sx
+            imag_part = torch.zeros_like(real_part)
         
-        # Normalize if required, but preserve structure better
+        # Normalize if requested
         if self.normalize:
-            # Improved normalization that preserves signal structure
-            magnitude = torch.sqrt(real_part**2 + imag_part**2 + self.eps)
-            mean_magnitude = torch.mean(magnitude)
-            # Scale magnitude to reasonable range without log
-            real_part = real_part / (mean_magnitude + self.eps) * 0.1
-            imag_part = imag_part / (mean_magnitude + self.eps) * 0.1
+            # Compute per-channel normalization for better stability
+            mean_value = torch.mean(torch.abs(real_part), dim=2, keepdim=True)
+            std_value = torch.std(real_part, dim=2, keepdim=True) + 1e-6
+            
+            # Simple standardization for numerical stability
+            real_part = (real_part - mean_value) / std_value * 0.1
+            imag_part = imag_part / (std_value + self.eps) * 0.1
         
-        # Check the shape for debugging
-        print(f"After normalization - Real: {real_part.shape}, Imag: {imag_part.shape}")
-        
-        if real_part.dim() == 4:
-            real_part = real_part.squeeze(2)
-            imag_part = imag_part.squeeze(2)
-
-        # Print final shape for debugging
+        # Print final dimensions for debugging
         print(f"Final WST output - Real: {real_part.shape}, Imag: {imag_part.shape}")
-
+        
         return (real_part, imag_part)
+
 
 class ParametricWaveletTransform(nn.Module):
     """

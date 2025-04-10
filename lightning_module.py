@@ -31,18 +31,28 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         self.save_hyperparameters(config)
         self.config = config
         
-        # Initialize wavelet scattering transform with reduced J value
+        # Initialize wavelet scattering transform
         self.wst = WaveletScatteringTransform(
-            J=config['wavelet']['J'],  # Now using J=2 instead of J=4
+            J=config['wavelet']['J'],
             Q=config['wavelet']['Q'],
             T=config['wavelet']['T'],
             sample_rate=config['data']['sample_rate'],
             normalize=True,
+            max_order=config['wavelet'].get('max_order', 1),  # Use simpler first-order coefficients
             ensure_output_dim=config['wavelet'].get('ensure_output_dim', True)
         )
         
+        # Calculate input channels more reliably
+        # In Kymatio, first-order scattering gives J*Q coefficients plus 1 lowpass
         J, Q = config['wavelet']['J'], config['wavelet']['Q']
-        input_channels = J * Q  # Correctly set to 12 with current config
+        
+        if config['wavelet'].get('max_order', 1) == 1:
+            # For first-order: lowpass + bandpass filters
+            input_channels = 1 + J * Q
+        else:
+            # For second-order: approximate formula
+            input_channels = 1 + J * Q + (J * Q)**2 // 4
+        
         print(f"Initializing encoder with {input_channels} input channels")
         
         # Extract model parameters from config
@@ -76,9 +86,14 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
             use_batch_norm=config['model']['use_batch_norm']
         )
         
+        # Enable gradient checkpointing if configured
+        if config['model'].get('use_gradient_checkpointing', False):
+            self.encoder.enable_gradient_checkpointing()
+            self.decoder.enable_gradient_checkpointing()
+        
         # Convert complex output to real
-        # Changed from 'magnitude' to 'real' to preserve phase information
-        self.to_real = ComplexToReal(mode='mag_phase')  
+        complex_repr = config['model'].get('complex_repr', 'mag_phase')
+        self.to_real = ComplexToReal(mode=complex_repr)
         
         # Initialize loss functions
         self.stft_loss = ComplexSTFTLoss()
@@ -88,8 +103,9 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         # Loss weights from config
         self.l1_weight = config['loss']['l1_weight']
         self.stft_weight = config['loss']['stft_weight']
-        self.complex_loss_weight = config['loss']['complex_loss_weight']  # Now 0.5 instead of 0.25
+        self.complex_loss_weight = config['loss']['complex_loss_weight']
         self.spectral_convergence_weight = config['loss']['spectral_convergence_weight']
+        self.phase_consistency_weight = config['loss'].get('phase_consistency_weight', 0.3)
         
         # Metrics
         self.train_step_outputs = []
@@ -98,7 +114,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
     
     def forward(self, x):
         """
-        Forward pass through the model with improved dimension handling
+        Forward pass through the model with robust dimension handling
         
         Args:
             x (Tensor): Input audio [B, T]
@@ -118,92 +134,78 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         # Ensure the input has the right length for wavelet transform
         target_length = self.config['wavelet']['T']
         if x.size(-1) != target_length:
-            # Pad or trim input to match the expected wavelet transform length
             if x.size(-1) < target_length:
-                # Pad
+                # Simply pad to target length
                 padding = target_length - x.size(-1)
                 x = F.pad(x, (0, padding))
             else:
-                # Trim
+                # Trim to target length
                 x = x[..., :target_length]
         
         # Apply wavelet scattering transform
-        print(f"Input to WST: {x.shape}")
         wst_output = self.wst(x)
         
-        # Verify tensor shapes after WST
+        # Print output shape for debugging
         if isinstance(wst_output, tuple):
             real, imag = wst_output
-            print(f"WST output - Real: {real.shape}, Imag: {imag.shape}")
-        else:
-            print(f"WST output: {wst_output.shape}")
-        
-        # Double-check for dimensional rotation
-        if isinstance(wst_output, tuple):
-            real, imag = wst_output
-            # If channels < time dimension, transpose to fix rotation
-            if real.size(1) < real.size(2):
-                print(f"Lightning module fixing dimensions: {real.shape} -> ", end="")
+            print(f"WST output before adaptation: Real {real.shape}, Imag {imag.shape}")
+            
+            # IMPORTANT: Adapt WST output to encoder's expected channels
+            num_channels = self.encoder.input_channels
+            
+            # If dimensions need to be transposed
+            if real.size(1) > real.size(2) * 2:  # Simple heuristic to detect wrong order
+                print("Transposing WST output dimensions...")
                 real = real.transpose(1, 2)
                 imag = imag.transpose(1, 2)
-                print(f"{real.shape}")
-                wst_output = (real, imag)
-        else:
-            # If channels < time dimension, transpose to fix rotation
-            if wst_output.size(1) < wst_output.size(2):
-                print(f"Lightning module fixing dimensions: {wst_output.shape} -> ", end="")
-                wst_output = wst_output.transpose(1, 2)
-                print(f"{wst_output.shape}")
+            
+            # Handle channel count mismatch
+            if real.size(1) != num_channels:
+                print(f"Adapting channel count from {real.size(1)} to {num_channels}")
+                
+                # Create adapted tensors regardless of whether we need more or fewer channels
+                adapted_real = torch.zeros(real.size(0), num_channels, real.size(2), device=real.device)
+                adapted_imag = torch.zeros(imag.size(0), num_channels, imag.size(2), device=imag.device)
+                
+                # Copy as many channels as we can (either truncating or partially filling)
+                copy_channels = min(real.size(1), num_channels)
+                adapted_real[:, :copy_channels] = real[:, :copy_channels]
+                adapted_imag[:, :copy_channels] = imag[:, :copy_channels]
+                
+                real = adapted_real
+                imag = adapted_imag
+                
+            print(f"WST output after adaptation: Real {real.shape}, Imag {imag.shape}")
+            wst_output = (real, imag)
         
         # Pass through encoder
-        print(f"Input to encoder: {wst_output[0].shape if isinstance(wst_output, tuple) else wst_output.shape}")
         encoded, intermediates = self.encoder(wst_output)
-        
-        # Print encoder output shape
-        if isinstance(encoded, tuple):
-            print(f"Encoder output - Real: {encoded[0].shape}, Imag: {encoded[1].shape}")
-        else:
-            print(f"Encoder output: {encoded.shape}")
         
         # Pass through decoder with skip connections
         decoded = self.decoder(encoded, intermediates)
         
-        # Print decoder output shape
-        if isinstance(decoded, tuple):
-            print(f"Decoder output - Real: {decoded[0].shape}, Imag: {decoded[1].shape}")
-        else:
-            print(f"Decoder output: {decoded.shape}")
-        
         # Convert complex output to real
         output = self.to_real(decoded)
-        print(f"After ComplexToReal: {output.shape}")
         
-        # Check for very small values in output
-        num_zeros = torch.sum((torch.abs(output) < 1e-6).float()).item()
-        total_elements = output.numel()
-        print(f"Final output - Percentage of near-zero values: {100 * num_zeros / total_elements:.2f}%")
-        
-        # Ensure output has the same length as the original input
+        # Reshape output to match temporal dimension of original audio
         if output.size(-1) != original_length:
-            print(f"Resizing output from {output.size(-1)} to {original_length}")
-            if output.size(-1) > original_length:
-                # Trim
-                output = output[..., :original_length]
-            else:
-                # Pad
-                padding = original_length - output.size(-1)
-                output = F.pad(output, (0, padding))
-        
-        # Match original dimensionality
-        if output.dim() != original_dim:
+            # Simple solution: use interpolation to match original length
+            if output.dim() == 2:
+                output = output.unsqueeze(1)
+            
+            output = F.interpolate(
+                output, 
+                size=original_length,
+                mode='linear', 
+                align_corners=False
+            )
+            
             if original_dim == 2 and output.dim() == 3:
                 output = output.squeeze(1)
         
-        # Check for NaN or Inf values in final output
-        has_nan = torch.isnan(output).any().item()
-        has_inf = torch.isinf(output).any().item()
-        if has_nan or has_inf:
-            print("WARNING: Final output contains NaN or Inf values!")
+        # Check for NaN or Inf values
+        if torch.isnan(output).any() or torch.isinf(output).any():
+            print("WARNING: Output contains NaN or Inf values, replacing with zeros")
             output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
         
         return output
@@ -232,7 +234,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         """
-        Training step with added phase consistency loss
+        Training step with enhanced phase consistency loss
         
         Args:
             batch (Tensor): Batch of audio samples [B, T]
@@ -253,34 +255,39 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         # Wavelet loss
         wst_loss = self.wavelet_loss(x_hat, x)
         
-        # Add explicit phase consistency loss
-        # Compute STFT for phase comparison
-        n_fft = 1024
-        hop_length = 256
-        window = torch.hann_window(n_fft).to(x.device)
+        # Calculate multi-resolution phase consistency loss
+        phase_consistency_loss = 0.0
+        for n_fft, hop_length in zip([512, 1024, 2048], [128, 256, 512]):
+            window = torch.hann_window(n_fft).to(x.device)
+            
+            # Compute complex STFT
+            x_stft = torch.stft(x, n_fft, hop_length, window=window, return_complex=True)
+            x_hat_stft = torch.stft(x_hat, n_fft, hop_length, window=window, return_complex=True)
+            
+            # Extract phase and magnitude information
+            x_phase = torch.angle(x_stft)
+            x_hat_phase = torch.angle(x_hat_stft)
+            x_mag = torch.abs(x_stft)
+            
+            # Weight phase difference by magnitude to focus on high-energy regions
+            phase_diff = torch.abs(torch.remainder(x_phase - x_hat_phase + np.pi, 2 * np.pi) - np.pi)
+            # Normalized magnitude weighting
+            mag_weight = x_mag / (torch.mean(x_mag) + 1e-8)
+            
+            # Weighted phase consistency (1 - cos(Δφ))
+            # This creates smoother gradients than direct phase difference
+            weighted_phase_loss = torch.mean(mag_weight * (1 - torch.cos(phase_diff)))
+            phase_consistency_loss += weighted_phase_loss
         
-        # Compute complex STFT
-        x_stft = torch.stft(x, n_fft, hop_length, window=window, return_complex=True)
-        x_hat_stft = torch.stft(x_hat, n_fft, hop_length, window=window, return_complex=True)
+        # Average across all resolutions
+        phase_consistency_loss /= 3.0
         
-        # Extract phase information
-        x_phase = torch.angle(x_stft)
-        x_hat_phase = torch.angle(x_hat_stft)
-        
-        # Compute phase consistency loss (1 - cos(Δφ))
-        # This penalizes phase differences proportionally to their angular distance
-        phase_diff = x_phase - x_hat_phase
-        phase_consistency_loss = torch.mean(1 - torch.cos(phase_diff))
-        
-        # Apply weight to phase consistency loss
-        phase_consistency_weight = 0.3
-        
-        # Combined loss with new phase component
+        # Combined loss with enhanced phase component
         loss = (
             self.l1_weight * l1_loss +
             self.stft_weight * tf_loss +
             self.complex_loss_weight * complex_loss +
-            phase_consistency_weight * phase_consistency_loss
+            self.phase_consistency_weight * phase_consistency_loss
         )
         
         # Log losses

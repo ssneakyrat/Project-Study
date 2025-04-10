@@ -12,6 +12,8 @@ from data.dataset import AudioDataModule
 from lightning_module import ComplexAudioEncoderDecoder
 
 
+# Modify the main function in train.py to include the gradient clipping
+
 def main(args):
     # Load configuration
     with open(args.config, 'r') as f:
@@ -51,7 +53,7 @@ def main(args):
         name=config['model_name']
     )
     
-    # Initialize trainer
+    # Initialize trainer with gradient clipping
     trainer = pl.Trainer(
         max_epochs=config['training']['max_epochs'],
         accelerator='gpu',
@@ -59,7 +61,8 @@ def main(args):
         callbacks=[checkpoint_callback, lr_monitor],
         logger=logger,
         precision=config['training']['precision'],
-        accumulate_grad_batches=config['training']['accumulate_grad_batches'],
+        accumulate_grad_batches=config['training'].get('accumulate_grad_batches', 1),
+        gradient_clip_val=config['training'].get('gradient_clip_val', None),  # Add gradient clipping
         log_every_n_steps=10
     )
     

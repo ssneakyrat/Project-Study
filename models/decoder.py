@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.complex_layers import ComplexConvTranspose1d, ComplexBatchNorm1d, ComplexLeakyReLU, ComplexTanh, ComplexDropout
 
-
 class ComplexDecoder(nn.Module):
     def __init__(self, latent_channels, channels, kernel_sizes, strides, paddings=None, output_paddings=None, 
                 output_channels=1, dropout=0.1, use_batch_norm=True):
@@ -98,10 +97,13 @@ class ComplexDecoder(nn.Module):
         self.strides = strides
         self.paddings = paddings
         self.output_paddings = output_paddings
+        
+        # Flag for gradient checkpointing
+        self.use_gradient_checkpointing = False
     
     def forward(self, x, skip_connections=None):
         """
-        Forward pass through decoder with skip connections
+        Forward pass through decoder with skip connections and optional gradient checkpointing
         
         Args:
             x (tuple): Tuple of (real, imaginary) tensors from encoder
@@ -116,8 +118,21 @@ class ComplexDecoder(nn.Module):
         
         # Pass through layers with skip connections
         for i, layer in enumerate(self.layers):
-            # Apply layer
-            x = layer(x)
+            # Apply gradient checkpointing if enabled
+            if self.use_gradient_checkpointing and i > 0 and i < len(self.layers) - 1:
+                # Only checkpoint middle layers for efficiency
+                def checkpoint_function(module, module_input):
+                    return module(module_input)
+                
+                x = torch.utils.checkpoint.checkpoint(
+                    checkpoint_function,
+                    layer, 
+                    x,
+                    use_reentrant=False
+                )
+            else:
+                # Regular forward pass
+                x = layer(x)
             
             # Handle skip connections with improved dimension matching
             if skip_connections is not None and i < len(skip_connections):
@@ -165,7 +180,10 @@ class ComplexDecoder(nn.Module):
                     x = (x_real + alpha * skip_real, x_imag + alpha * skip_imag)
         
         return x
-
+    
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing to reduce memory usage"""
+        self.use_gradient_checkpointing = True
 
 class ComplexUpsampleBlock(nn.Module):
     """

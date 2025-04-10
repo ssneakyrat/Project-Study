@@ -276,9 +276,9 @@ class ComplexDropout(nn.Module):
 
 
 class ComplexToReal(nn.Module):
-    def __init__(self, mode='real'):  # Using 'real' now as default for stability
+    def __init__(self, mode='mag_phase'):  # Default to mag_phase for better reconstruction
         """
-        Convert complex-valued tensor to real-valued tensor
+        Convert complex-valued tensor to real-valued tensor with improved phase handling
         
         Args:
             mode (str): Conversion mode, one of ['magnitude', 'real', 'imag', 'phase', 'mag_phase']
@@ -290,7 +290,7 @@ class ComplexToReal(nn.Module):
         
     def forward(self, x):
         """
-        Forward pass
+        Forward pass with improved phase preservation
         
         Args:
             x (tuple): Tuple of (real, imag) tensors
@@ -305,9 +305,6 @@ class ComplexToReal(nn.Module):
         else:
             return x  # Already real
         
-        # Print shapes for debugging
-        print(f"ComplexToReal input shapes - Real: {x_real.shape}, Imag: {x_imag.shape}")
-        
         if self.mode == 'magnitude':
             out = torch.sqrt(x_real**2 + x_imag**2)
         elif self.mode == 'real':
@@ -317,26 +314,30 @@ class ComplexToReal(nn.Module):
         elif self.mode == 'phase':
             out = torch.atan2(x_imag, x_real)
         elif self.mode == 'mag_phase':
-            # Improved combination of magnitude and phase
-            # This approach preserves more structural information
+            # Enhanced magnitude and phase combination for better reconstruction
+            # This preserves both amplitude and phase information
             mag = torch.sqrt(x_real**2 + x_imag**2)
             phase = torch.atan2(x_imag, x_real)
+            
+            # Apply a smooth non-linearity to magnitude for better dynamic range
+            mag = torch.tanh(mag) * (1 + mag)
+            
+            # Reconstruct signal using magnitude and phase
+            # This maintains temporal coherence better than simple magnitude
             out = mag * torch.cos(phase)
         
-        # Print output shape
-        print(f"ComplexToReal output shape: {out.shape}")
-        
-        # Check for very small values
-        num_zeros = torch.sum((torch.abs(out) < 1e-6).float()).item()
-        total_elements = out.numel()
-        print(f"Percentage of near-zero values: {100 * num_zeros / total_elements:.2f}%")
+        # Ensure non-zero amplitudes to prevent artifacts
+        zero_mask = (torch.abs(out) < 1e-7)
+        if zero_mask.any():
+            # Add small amount of noise to prevent dead regions
+            noise = torch.randn_like(out) * 1e-6
+            out = torch.where(zero_mask, noise, out)
         
         # Check for NaN or inf values
         has_nan = torch.isnan(out).any().item()
         has_inf = torch.isinf(out).any().item()
         if has_nan or has_inf:
-            print("WARNING: Output contains NaN or Inf values!")
-            # Replace NaN/Inf with zeros
-            out = torch.nan_to_num(out, nan=0.0, posinf=1.0, neginf=-1.0)
+            # Replace NaN/Inf with zeros with small noise
+            out = torch.nan_to_num(out, nan=1e-6, posinf=1.0, neginf=-1.0)
         
         return out

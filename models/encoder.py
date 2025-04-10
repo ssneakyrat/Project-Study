@@ -75,10 +75,13 @@ class ComplexEncoder(nn.Module):
         self.kernel_sizes = kernel_sizes
         self.strides = strides
         self.paddings = paddings
+        
+        # Flag for gradient checkpointing
+        self.use_gradient_checkpointing = False
     
     def forward(self, x):
         """
-        Forward pass through encoder
+        Forward pass through encoder with optional gradient checkpointing
         
         Args:
             x (tuple): Tuple of (real, imaginary) tensors
@@ -92,23 +95,28 @@ class ComplexEncoder(nn.Module):
         
         # Pass through layers and store intermediates for skip connections
         for i, layer in enumerate(self.layers):
-            # Debug shape tracking (uncomment for debugging)
-            # if isinstance(x, tuple):
-            #     print(f"Encoder layer {i} input shape: {x[0].shape}")
-            # else:
-            #     print(f"Encoder layer {i} input shape: {x.shape}")
-            
-            x = layer(x)
+            # Apply gradient checkpointing if enabled
+            if self.use_gradient_checkpointing and i > 0 and i < len(self.layers) - 1:
+                # Only checkpoint middle layers for efficiency
+                def checkpoint_function(module, module_input):
+                    return module(module_input)
+                
+                x = torch.utils.checkpoint.checkpoint(
+                    checkpoint_function, 
+                    layer, 
+                    x,
+                    use_reentrant=False
+                )
+            else:
+                x = layer(x)
+                
             intermediates.append(x)
-            
-            # Debug shape tracking (uncomment for debugging)
-            # if isinstance(x, tuple):
-            #     print(f"Encoder layer {i} output shape: {x[0].shape}")
-            # else:
-            #     print(f"Encoder layer {i} output shape: {x.shape}")
         
         return x, intermediates
-
+    
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing to reduce memory usage"""
+        self.use_gradient_checkpointing = True
 
 class ComplexResidualBlock(nn.Module):
     """
