@@ -18,13 +18,42 @@ class ComplexConv1d(nn.Module):
         """
         real, imag = x.real, x.imag
         
-        real_real = self.conv_real(real)
-        real_imag = self.conv_imag(real)
-        imag_real = self.conv_real(imag)
-        imag_imag = self.conv_imag(imag)
+        # Compute real part directly (memory optimized)
+        real_out = self.conv_real(real) - self.conv_imag(imag)
+        # Compute imag part directly (memory optimized)
+        imag_out = self.conv_imag(real) + self.conv_real(imag)
         
-        real_out = real_real - imag_imag
-        imag_out = real_imag + imag_real
+        return torch.complex(real_out, imag_out)
+
+
+class ComplexConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        # Handle different kernel sizes for different dimensions
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding)
+            
+        self.conv_real = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        self.conv_imag = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        
+    def forward(self, x):
+        """
+        Args:
+            x: Complex tensor of shape (batch_size, channels, height, width)
+        
+        Returns:
+            Complex tensor after convolution
+        """
+        real, imag = x.real, x.imag
+        
+        # Compute real part directly (memory optimized)
+        real_out = self.conv_real(real) - self.conv_imag(imag)
+        # Compute imag part directly (memory optimized) 
+        imag_out = self.conv_imag(real) + self.conv_real(imag)
         
         return torch.complex(real_out, imag_out)
 
@@ -47,13 +76,46 @@ class ComplexConvTranspose1d(nn.Module):
         """
         real, imag = x.real, x.imag
         
-        real_real = self.conv_transpose_real(real)
-        real_imag = self.conv_transpose_imag(real)
-        imag_real = self.conv_transpose_real(imag)
-        imag_imag = self.conv_transpose_imag(imag)
+        # Compute real part directly (memory optimized)
+        real_out = self.conv_transpose_real(real) - self.conv_transpose_imag(imag)
+        # Compute imag part directly (memory optimized)
+        imag_out = self.conv_transpose_imag(real) + self.conv_transpose_real(imag)
         
-        real_out = real_real - imag_imag
-        imag_out = real_imag + imag_real
+        return torch.complex(real_out, imag_out)
+
+
+class ComplexConvTranspose2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, output_padding=0):
+        super().__init__()
+        # Handle different kernel sizes for different dimensions
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding)
+        if isinstance(output_padding, int):
+            output_padding = (output_padding, output_padding)
+            
+        self.conv_transpose_real = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, stride, padding, output_padding)
+        self.conv_transpose_imag = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, stride, padding, output_padding)
+        
+    def forward(self, x):
+        """
+        Args:
+            x: Complex tensor of shape (batch_size, channels, height, width)
+        
+        Returns:
+            Complex tensor after transposed convolution
+        """
+        real, imag = x.real, x.imag
+        
+        # Compute real part directly (memory optimized)
+        real_out = self.conv_transpose_real(real) - self.conv_transpose_imag(imag)
+        # Compute imag part directly (memory optimized)
+        imag_out = self.conv_transpose_imag(real) + self.conv_transpose_real(imag)
         
         return torch.complex(real_out, imag_out)
 
@@ -80,6 +142,28 @@ class ComplexBatchNorm1d(nn.Module):
         return torch.complex(real_out, imag_out)
 
 
+class ComplexBatchNorm2d(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.bn_real = nn.BatchNorm2d(num_features)
+        self.bn_imag = nn.BatchNorm2d(num_features)
+        
+    def forward(self, x):
+        """
+        Args:
+            x: Complex tensor of shape (batch_size, channels, height, width)
+        
+        Returns:
+            Complex tensor after batch normalization
+        """
+        real, imag = x.real, x.imag
+        
+        real_out = self.bn_real(real)
+        imag_out = self.bn_imag(imag)
+        
+        return torch.complex(real_out, imag_out)
+
+
 class ComplexPReLU(nn.Module):
     def __init__(self, num_parameters=1, init=0.25):
         super().__init__()
@@ -89,7 +173,7 @@ class ComplexPReLU(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: Complex tensor of shape (batch_size, channels, time)
+            x: Complex tensor
         
         Returns:
             Complex tensor after PReLU activation
