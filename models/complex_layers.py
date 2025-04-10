@@ -54,6 +54,11 @@ class ComplexConv1d(nn.Module):
         else:  # Handle the case where input is real
             x_real, x_imag = x, torch.zeros_like(x)
         
+        # FIX: Check and transpose dimensions if needed
+        if x_real.size(1) > x_real.size(2):  # If time dimension (1) > channel dimension (2)
+            x_real = x_real.transpose(1, 2)
+            x_imag = x_imag.transpose(1, 2)
+
         # Real component: (W_re * x_re - W_im * x_im)
         real = self.conv_re(x_real) - self.conv_im(x_imag)
         

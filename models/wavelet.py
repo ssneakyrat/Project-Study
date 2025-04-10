@@ -115,6 +115,11 @@ class WaveletScatteringTransform(nn.Module):
             imag_part = imag_part.transpose(1, 2)
             print(f"{real_part.shape}")
         
+        # Fix: Remove extra dimension before returning
+        if real_part.dim() == 4:  # If we have [B, C, 1, T]
+            real_part = real_part.squeeze(2)
+            imag_part = imag_part.squeeze(2)
+
         # Print final shape for debugging
         print(f"Final WST output - Real: {real_part.shape}, Imag: {imag_part.shape}")
         
