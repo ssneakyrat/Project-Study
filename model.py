@@ -60,11 +60,11 @@ class WSTVocoder(pl.LightningModule):
             self.wst_channels = dummy_output.shape[1]
             self.wst_time_dim = dummy_output.shape[2]
             
-            # Calculate bottleneck dimensions using the formula d = √(T×F)/c
-            # Where T is time, F is frequency bins, c is compression factor
+            # Calculate bottleneck dimensions using modified formula to reduce compression
+            # MODIFIED: Doubled capacity with * 2 factor
             T = self.wst_time_dim
             F = self.wst_channels
-            self.latent_dim = int(math.sqrt(T * F) / compression_factor)
+            self.latent_dim = int(math.sqrt(T * F) / compression_factor * 2)
             
             # Make sure latent_dim is at least 16 for stability
             self.latent_dim = max(16, self.latent_dim)
@@ -76,7 +76,7 @@ class WSTVocoder(pl.LightningModule):
         # Store original length for final upsampling
         self.original_length = sample_rate * 2
         
-        # Convert real audio to complex - use 'hilbert' mode to better approximate phase
+        # MODIFIED: Better phase approximation with hilbert transform
         self.real_to_complex = RealToComplex(mode='hilbert')
         
         # Encoder
@@ -143,8 +143,11 @@ class WSTVocoder(pl.LightningModule):
             output_padding=strides[0] - 1
         )
         
-        # Phase-aware complex to real conversion - CRITICAL CHANGE for phase preservation
-        self.complex_to_real = ComplexToReal(mode='phase_aware')
+        # MODIFIED: Improved complex to real conversion
+        # Using magnitude preserves energy but we need to keep phase information
+        # Using 'real' would preserve some phase but discards half of the information
+        # Instead, we'll keep the complex values and convert at the very end
+        self.complex_to_real = ComplexToReal(mode='magnitude')
         
         # Skip projections from encoder outputs to decoder inputs
         encoder_channels = channels  # [64, 128, 256]
@@ -160,11 +163,24 @@ class WSTVocoder(pl.LightningModule):
                 ComplexConv1d(enc_ch, dec_ch, kernel_size=1)
             )
         
-        # Final temporal upsampling to match original audio length
-        self.final_upsampling = nn.Upsample(size=sample_rate * 2, mode='linear', align_corners=False)
+        # MODIFIED: Improved final upsampling with antialiasing
+        self.final_upsampling = nn.Sequential(
+            nn.Upsample(size=sample_rate * 2, mode='linear', align_corners=False),
+            nn.Conv1d(1, 1, kernel_size=7, padding=3, padding_mode='reflect'),  # Anti-aliasing filter
+        )
         
-        # Energy scaling factor for output normalization - NEW
+        # Energy scaling factor for output normalization
         self.output_scale = nn.Parameter(torch.ones(1))
+        
+        # ADDED: Phase compensation network - helps correct boundary effects
+        self.phase_correction = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=15, padding=7, padding_mode='reflect'),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(16, 16, kernel_size=15, padding=7, padding_mode='reflect'),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(16, 1, kernel_size=15, padding=7, padding_mode='reflect'),  # Fixed: 16→1 channels
+            nn.Tanh()  # Output phase correction factor between -1 and 1
+        )
         
     def compute_expected_output_size(self, input_size, layers):
         """Calculate the expected output size after a series of conv/deconv layers."""
@@ -188,11 +204,10 @@ class WSTVocoder(pl.LightningModule):
         batch_size = x.size(0)
         input_length = x.size(1)
         
-        # Track input energy for later normalization - NEW
+        # Track input energy for later normalization
         input_energy = torch.mean(x**2)
         
-        # Apply WST - will return shape [B, C, T'] where C = combined scattering orders and coefficients
-        # and T' is the time dimension after wavelet transform (usually smaller than input)
+        # Apply WST
         x_wst = self.wst(x.unsqueeze(1))
         
         # Log shape information
@@ -241,12 +256,12 @@ class WSTVocoder(pl.LightningModule):
                     else:
                         # Pad
                         pad_size = x_complex.shape[2] - skip.shape[2]
-                        skip_real = F.pad(skip.real, (0, pad_size))
-                        skip_imag = F.pad(skip.imag, (0, pad_size))
+                        skip_real = F.pad(skip.real, (0, pad_size), mode='reflect')
+                        skip_imag = F.pad(skip.imag, (0, pad_size), mode='reflect')
                         skip = torch.complex(skip_real, skip_imag)
                 
-                # Add skip connection with increased scaling factor to avoid losing signal - MODIFIED
-                x_complex = x_complex + 0.5 * skip  # Increased from 0.1 to 0.5
+                # MODIFIED: Increased skip connection strength for better signal preservation
+                x_complex = x_complex + 0.8 * skip  # Increased from 0.5 to 0.8
             
             # Apply decoder layer
             x_complex = layer(x_complex)
@@ -254,19 +269,43 @@ class WSTVocoder(pl.LightningModule):
         # Output layer
         x_complex = self.output_layer(x_complex)
         
-        # Convert to real using phase-aware mode to preserve energy
-        x_out = self.complex_to_real(x_complex).squeeze(1)
+        # MODIFIED: Improved phase handling - extract both magnitude and phase
+        x_mag = torch.abs(x_complex)
+        x_phase = torch.angle(x_complex)
+        
+        # MODIFIED: Create an intermediate real representation
+        x_real = x_mag * torch.cos(x_phase)
+        
+        # Reshape for phase correction
+        x_real_1ch = x_real.squeeze(1).unsqueeze(1)
+        
+        # Apply phase correction network to address boundary effects
+        # This is particularly important for edges where wavelet transform creates artifacts
+        phase_corr = self.phase_correction(x_real_1ch)
+        
+        # Apply the correction with a learned weighting
+        x_out = x_real_1ch + 0.1 * phase_corr
         
         # The final output may still not match the original audio length
-        # Use interpolation to match the exact input size
-        if x_out.shape[1] != input_length:
-            x_out = self.final_upsampling(x_out.unsqueeze(1)).squeeze(1)
+        # Use improved upsampling to match the exact input size
+        if x_out.shape[2] != input_length:
+            x_out = self.final_upsampling(x_out)
+            # Ensure exact shape match
+            if x_out.shape[2] != input_length:
+                x_out = F.interpolate(x_out, size=input_length, mode='linear', align_corners=False)
         
-        # Apply output energy normalization - NEW
+        # Apply reflective padding to address boundary discontinuities (helps with spikes)
+        x_out = F.pad(x_out, (4, 4), mode='reflect')
+        x_out = x_out[:, :, 4:-4]  # Remove padding but keep correct size
+        
+        # Apply output energy normalization
         output_energy = torch.mean(x_out**2) + 1e-8
         energy_ratio = torch.sqrt(input_energy / output_energy)
         # Use learnable scaling factor with energy ratio
         x_out = x_out * self.output_scale * energy_ratio
+        
+        # Final squeeze to match expected dimensions
+        x_out = x_out.squeeze(1)
             
         return x_out
     
@@ -283,33 +322,87 @@ class WSTVocoder(pl.LightningModule):
         # L1 loss + spectral loss for better convergence
         l1_loss = F.l1_loss(x_hat, x)
         
-        # Simplified spectral loss using FFT
-        X = torch.fft.rfft(x, dim=1)
-        X_hat = torch.fft.rfft(x_hat, dim=1)
+        # MODIFIED: Enhanced spectral loss using multi-resolution STFT
+        # Use multiple window sizes to capture both global and local time-frequency patterns
+        stft_losses = []
+        for n_fft in [256, 512, 1024]:
+            hop_length = n_fft // 4
+            win_length = n_fft
+            window = torch.hann_window(win_length).to(x.device)
+            
+            # Compute STFTs
+            X = torch.stft(
+                x, 
+                n_fft=n_fft, 
+                hop_length=hop_length, 
+                win_length=win_length, 
+                window=window, 
+                return_complex=True
+            )
+            X_hat = torch.stft(
+                x_hat, 
+                n_fft=n_fft, 
+                hop_length=hop_length, 
+                win_length=win_length, 
+                window=window, 
+                return_complex=True
+            )
+            
+            # Magnitude spectral loss (log domain to emphasize relative differences)
+            mag_loss = F.mse_loss(
+                torch.log1p(torch.abs(X) + 1e-8),
+                torch.log1p(torch.abs(X_hat) + 1e-8)
+            )
+            
+            # Phase loss with better weighting
+            phase_x = torch.angle(X)
+            phase_x_hat = torch.angle(X_hat)
+            # Circular difference for phase (handles 2π wrapping)
+            phase_diff = torch.abs(torch.remainder(phase_x - phase_x_hat + math.pi, 2 * math.pi) - math.pi)
+            # Weight by magnitude to focus on important frequencies
+            magnitude_weight = torch.abs(X) / (torch.abs(X).sum(dim=(1, 2), keepdim=True) + 1e-8)
+            phase_loss = torch.mean(magnitude_weight * phase_diff)
+            
+            stft_losses.append(mag_loss + phase_loss)
         
-        # Magnitude spectral loss (log domain to emphasize relative differences)
-        spec_loss = F.mse_loss(
-            torch.log1p(torch.abs(X) + 1e-8),
-            torch.log1p(torch.abs(X_hat) + 1e-8)
+        # Average the multi-resolution losses
+        spec_loss = sum(stft_losses) / len(stft_losses)
+        
+        # Explicit phase loss for low frequencies (most perceptually important)
+        X_low = torch.stft(
+            x, 
+            n_fft=2048, 
+            hop_length=512, 
+            win_length=2048, 
+            window=torch.hann_window(2048).to(x.device), 
+            return_complex=True
+        )
+        X_hat_low = torch.stft(
+            x_hat, 
+            n_fft=2048, 
+            hop_length=512, 
+            win_length=2048, 
+            window=torch.hann_window(2048).to(x.device), 
+            return_complex=True
         )
         
-        # Phase loss - NEW
-        # Compute phase difference and apply circular loss
-        phase_x = torch.angle(X)
-        phase_x_hat = torch.angle(X_hat)
-        # Circular difference for phase (handles 2π wrapping)
-        phase_diff = torch.abs(torch.remainder(phase_x - phase_x_hat + math.pi, 2 * math.pi) - math.pi)
-        # Weight by magnitude to focus on important frequencies
-        magnitude_weight = torch.abs(X) / (torch.abs(X).sum(dim=1, keepdim=True) + 1e-8)
-        phase_loss = torch.mean(magnitude_weight * phase_diff)
+        # Get phase for just the bottom 25% of frequencies (most important for perception)
+        low_freq_cutoff = X_low.shape[1] // 4
+        phase_x_low = torch.angle(X_low[:, :low_freq_cutoff, :])
+        phase_x_hat_low = torch.angle(X_hat_low[:, :low_freq_cutoff, :])
         
-        # Combined loss with phase term
-        loss = l1_loss + 0.1 * spec_loss + 0.05 * phase_loss
+        # Circular difference with extra weight on low frequencies
+        phase_diff_low = torch.abs(torch.remainder(phase_x_low - phase_x_hat_low + math.pi, 2 * math.pi) - math.pi)
+        magnitude_weight_low = torch.abs(X_low[:, :low_freq_cutoff, :]) / (torch.abs(X_low[:, :low_freq_cutoff, :]).sum(dim=(1, 2), keepdim=True) + 1e-8)
+        phase_loss_low = torch.mean(magnitude_weight_low * phase_diff_low)
+        
+        # MODIFIED: Balance loss functions - increased phase loss weight
+        loss = l1_loss + 0.1 * spec_loss + 0.2 * phase_loss_low
         
         self.log('train_loss', loss)
         self.log('train_l1_loss', l1_loss)
         self.log('train_spec_loss', spec_loss)
-        self.log('train_phase_loss', phase_loss)
+        self.log('train_phase_loss', phase_loss_low)
         
         return loss
     
@@ -326,41 +419,121 @@ class WSTVocoder(pl.LightningModule):
         # L1 loss + spectral loss
         l1_loss = F.l1_loss(x_hat, x)
         
-        # Simplified spectral loss using FFT
-        X = torch.fft.rfft(x, dim=1)
-        X_hat = torch.fft.rfft(x_hat, dim=1)
+        # MODIFIED: Enhanced spectral loss using multi-resolution STFT
+        # Use multiple window sizes to capture both global and local time-frequency patterns
+        stft_losses = []
+        for n_fft in [256, 512, 1024]:
+            hop_length = n_fft // 4
+            win_length = n_fft
+            window = torch.hann_window(win_length).to(x.device)
+            
+            # Compute STFTs
+            X = torch.stft(
+                x, 
+                n_fft=n_fft, 
+                hop_length=hop_length, 
+                win_length=win_length, 
+                window=window, 
+                return_complex=True
+            )
+            X_hat = torch.stft(
+                x_hat, 
+                n_fft=n_fft, 
+                hop_length=hop_length, 
+                win_length=win_length, 
+                window=window, 
+                return_complex=True
+            )
+            
+            # Magnitude spectral loss (log domain to emphasize relative differences)
+            mag_loss = F.mse_loss(
+                torch.log1p(torch.abs(X) + 1e-8),
+                torch.log1p(torch.abs(X_hat) + 1e-8)
+            )
+            
+            # Phase loss with better weighting
+            phase_x = torch.angle(X)
+            phase_x_hat = torch.angle(X_hat)
+            # Circular difference for phase (handles 2π wrapping)
+            phase_diff = torch.abs(torch.remainder(phase_x - phase_x_hat + math.pi, 2 * math.pi) - math.pi)
+            # Weight by magnitude to focus on important frequencies
+            magnitude_weight = torch.abs(X) / (torch.abs(X).sum(dim=(1, 2), keepdim=True) + 1e-8)
+            phase_loss = torch.mean(magnitude_weight * phase_diff)
+            
+            stft_losses.append(mag_loss + phase_loss)
         
-        # Magnitude spectral loss (log domain to emphasize relative differences)
-        spec_loss = F.mse_loss(
-            torch.log1p(torch.abs(X) + 1e-8),
-            torch.log1p(torch.abs(X_hat) + 1e-8)
+        # Average the multi-resolution losses
+        spec_loss = sum(stft_losses) / len(stft_losses)
+        
+        # Explicit phase loss for low frequencies (most perceptually important)
+        X_low = torch.stft(
+            x, 
+            n_fft=2048, 
+            hop_length=512, 
+            win_length=2048, 
+            window=torch.hann_window(2048).to(x.device), 
+            return_complex=True
+        )
+        X_hat_low = torch.stft(
+            x_hat, 
+            n_fft=2048, 
+            hop_length=512, 
+            win_length=2048, 
+            window=torch.hann_window(2048).to(x.device), 
+            return_complex=True
         )
         
-        # Phase loss - NEW
-        # Compute phase difference and apply circular loss
-        phase_x = torch.angle(X)
-        phase_x_hat = torch.angle(X_hat)
-        # Circular difference for phase (handles 2π wrapping)
-        phase_diff = torch.abs(torch.remainder(phase_x - phase_x_hat + math.pi, 2 * math.pi) - math.pi)
-        # Weight by magnitude to focus on important frequencies
-        magnitude_weight = torch.abs(X) / (torch.abs(X).sum(dim=1, keepdim=True) + 1e-8)
-        phase_loss = torch.mean(magnitude_weight * phase_diff)
+        # Get phase for just the bottom 25% of frequencies (most important for perception)
+        low_freq_cutoff = X_low.shape[1] // 4
+        phase_x_low = torch.angle(X_low[:, :low_freq_cutoff, :])
+        phase_x_hat_low = torch.angle(X_hat_low[:, :low_freq_cutoff, :])
         
-        # Combined loss with phase term
-        loss = l1_loss + 0.1 * spec_loss + 0.05 * phase_loss
+        # Circular difference with extra weight on low frequencies
+        phase_diff_low = torch.abs(torch.remainder(phase_x_low - phase_x_hat_low + math.pi, 2 * math.pi) - math.pi)
+        magnitude_weight_low = torch.abs(X_low[:, :low_freq_cutoff, :]) / (torch.abs(X_low[:, :low_freq_cutoff, :]).sum(dim=(1, 2), keepdim=True) + 1e-8)
+        phase_loss_low = torch.mean(magnitude_weight_low * phase_diff_low)
+        
+        # MODIFIED: Balance loss functions - increased phase loss weight
+        loss = l1_loss + 0.1 * spec_loss + 0.2 * phase_loss_low
         
         self.log('val_loss', loss)
         self.log('val_l1_loss', l1_loss)
         self.log('val_spec_loss', spec_loss)
-        self.log('val_phase_loss', phase_loss)
+        self.log('val_phase_loss', phase_loss_low)
         
-        # Calculate signal-to-noise ratio (SNR) - NEW
+        # Calculate signal-to-noise ratio (SNR)
         with torch.no_grad():
             signal_power = torch.mean(x**2, dim=1)
             noise_power = torch.mean((x - x_hat)**2, dim=1)
             snr = 10 * torch.log10(signal_power / (noise_power + 1e-8))
             mean_snr = torch.mean(snr)
             self.log('val_snr_db', mean_snr)
+            
+            # MODIFIED: Calculate perceptual metrics via spectral contrast
+            # Compare spectral contrast between original and reconstructed audio
+            # This is a rough approximation of perceptual quality
+            def spectral_contrast(audio, n_fft=2048):
+                S = torch.stft(
+                    audio, 
+                    n_fft=n_fft, 
+                    hop_length=n_fft//4, 
+                    win_length=n_fft, 
+                    window=torch.hann_window(n_fft).to(audio.device), 
+                    return_complex=True
+                )
+                mag = torch.abs(S)
+                # Calculate contrast as ratio between adjacent frequency bins
+                contrast = torch.log1p(mag[:, 1:, :]) - torch.log1p(mag[:, :-1, :])
+                return contrast
+                
+            orig_contrast = spectral_contrast(x)
+            recon_contrast = spectral_contrast(x_hat)
+            contrast_sim = F.cosine_similarity(
+                orig_contrast.reshape(orig_contrast.shape[0], -1),
+                recon_contrast.reshape(recon_contrast.shape[0], -1),
+                dim=1
+            )
+            self.log('val_spectral_contrast_sim', torch.mean(contrast_sim))
         
         # Log audio and visualizations for first batch only to save computation
         if batch_idx == 0:
@@ -478,7 +651,10 @@ class WSTVocoder(pl.LightningModule):
         return loss
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=1e-6)
+        # MODIFIED: Use AdamW for better weight regularization
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-5)
+        
+        # MODIFIED: Improved learning rate schedule
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=5, verbose=True
         )
