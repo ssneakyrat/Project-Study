@@ -23,11 +23,22 @@ class WaveletScatteringTransform(nn.Module):
         self.J = J
         self.Q = Q
         self.T = T
+        self.max_order = max_order
+        self.out_type = out_type
+        
+        # Precompute coefficients count for each order
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, 1, T)
+            Sx = self.scattering(dummy_input)
+            if Sx.dim() == 4:
+                self.total_coeffs = Sx.shape[1] * Sx.shape[2]
+            else:
+                self.total_coeffs = Sx.shape[1]
         
     def forward(self, x):
         """
         Args:
-            x: Input tensor of shape (batch_size, 1, T)
+            x: Input tensor of shape (batch_size, 1, T) or (batch_size, T)
         
         Returns:
             Scattering coefficients reshaped for complex CNN
@@ -35,6 +46,17 @@ class WaveletScatteringTransform(nn.Module):
         # Ensure input has the right shape
         if x.dim() == 2:
             x = x.unsqueeze(1)
+        
+        # Pad or trim input if necessary to match expected length T
+        _, _, L = x.shape
+        if L != self.T:
+            if L < self.T:
+                # Pad
+                pad_size = self.T - L
+                x = torch.nn.functional.pad(x, (0, pad_size))
+            else:
+                # Trim
+                x = x[:, :, :self.T]
         
         # Apply scattering transform
         Sx = self.scattering(x)
@@ -45,5 +67,9 @@ class WaveletScatteringTransform(nn.Module):
             # Combine order and coef dimensions
             B, O, C, T = Sx.shape
             Sx = Sx.reshape(B, O * C, T)
+        
+        # Apply log1p to increase dynamic range of coefficients
+        # This helps preserve low-amplitude information
+        Sx = torch.log1p(torch.abs(Sx)) * torch.sign(Sx)
         
         return Sx
