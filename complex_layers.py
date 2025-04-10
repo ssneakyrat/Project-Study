@@ -18,13 +18,10 @@ class ComplexConv1d(nn.Module):
         """
         real, imag = x.real, x.imag
         
-        real_real = self.conv_real(real)
-        real_imag = self.conv_imag(real)
-        imag_real = self.conv_real(imag)
-        imag_imag = self.conv_imag(imag)
-        
-        real_out = real_real - imag_imag
-        imag_out = real_imag + imag_real
+        # Compute real part directly (memory optimized)
+        real_out = self.conv_real(real) - self.conv_imag(imag)
+        # Compute imag part directly (memory optimized)
+        imag_out = self.conv_imag(real) + self.conv_real(imag)
         
         return torch.complex(real_out, imag_out)
 
@@ -53,13 +50,10 @@ class ComplexConv2d(nn.Module):
         """
         real, imag = x.real, x.imag
         
-        real_real = self.conv_real(real)
-        real_imag = self.conv_imag(real)
-        imag_real = self.conv_real(imag)
-        imag_imag = self.conv_imag(imag)
-        
-        real_out = real_real - imag_imag
-        imag_out = real_imag + imag_real
+        # Compute real part directly (memory optimized)
+        real_out = self.conv_real(real) - self.conv_imag(imag)
+        # Compute imag part directly (memory optimized) 
+        imag_out = self.conv_imag(real) + self.conv_real(imag)
         
         return torch.complex(real_out, imag_out)
 
@@ -82,13 +76,10 @@ class ComplexConvTranspose1d(nn.Module):
         """
         real, imag = x.real, x.imag
         
-        real_real = self.conv_transpose_real(real)
-        real_imag = self.conv_transpose_imag(real)
-        imag_real = self.conv_transpose_real(imag)
-        imag_imag = self.conv_transpose_imag(imag)
-        
-        real_out = real_real - imag_imag
-        imag_out = real_imag + imag_real
+        # Compute real part directly (memory optimized)
+        real_out = self.conv_transpose_real(real) - self.conv_transpose_imag(imag)
+        # Compute imag part directly (memory optimized)
+        imag_out = self.conv_transpose_imag(real) + self.conv_transpose_real(imag)
         
         return torch.complex(real_out, imag_out)
 
@@ -121,13 +112,10 @@ class ComplexConvTranspose2d(nn.Module):
         """
         real, imag = x.real, x.imag
         
-        real_real = self.conv_transpose_real(real)
-        real_imag = self.conv_transpose_imag(real)
-        imag_real = self.conv_transpose_real(imag)
-        imag_imag = self.conv_transpose_imag(imag)
-        
-        real_out = real_real - imag_imag
-        imag_out = real_imag + imag_real
+        # Compute real part directly (memory optimized)
+        real_out = self.conv_transpose_real(real) - self.conv_transpose_imag(imag)
+        # Compute imag part directly (memory optimized)
+        imag_out = self.conv_transpose_imag(real) + self.conv_transpose_real(imag)
         
         return torch.complex(real_out, imag_out)
 

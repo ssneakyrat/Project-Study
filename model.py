@@ -43,10 +43,10 @@ class DecoderBlock(nn.Module):
 class WSTVocoder(pl.LightningModule):
     def __init__(self,
                  sample_rate=16000,
-                 wst_J=8,
-                 wst_Q=8,
-                 channels=[64, 128, 256],
-                 latent_dim=64,
+                 wst_J=6,  # Reduced from 8
+                 wst_Q=6,  # Reduced from 8
+                 channels=[32, 64, 128],  # Reduced from [64, 128, 256]
+                 latent_dim=32,  # Reduced from 64
                  kernel_size=3,
                  stride=2,
                  compression_factor=16,
@@ -80,20 +80,20 @@ class WSTVocoder(pl.LightningModule):
         padding = (kernel_size[0] // 2, kernel_size[1] // 2)
         output_padding = (stride[0] - 1, stride[1] - 1)
         
-        # WST layer
+        # WST layer with reduced parameters to save memory
         self.wst = WaveletScatteringTransform(
-            J=wst_J,
-            Q=wst_Q,
-            T=sample_rate * 2,  # 2 seconds of audio
-            max_order=2,
+            J=min(6, wst_J),  # Cap at 6 to limit memory
+            Q=min(6, wst_Q),  # Cap at 6 to limit memory
+            T=sample_rate,    # Reduced from 2 seconds to 1 second
+            max_order=1,      # Reduced from 2 to 1
             out_type='array'
         )
         
         # Convert real audio to complex
         self.real_to_complex = RealToComplex(mode='zero_imag')
         
-        # Initial projection to standardize WST output channels
-        self.initial_projection = ComplexConv2d(1, channels[0], kernel_size=1)
+        # Initial projection layer handles the reduced WST dimension (now 3 channels)
+        self.initial_projection = ComplexConv2d(3, channels[0], kernel_size=1)
         
         # Encoder blocks
         self.encoder_blocks = nn.ModuleList()
@@ -108,10 +108,16 @@ class WSTVocoder(pl.LightningModule):
                 )
             )
         
-        # Latent projection
+        # Latent projection - derive bottleneck dimension using the formula
+        # d = √(T×F)/c where T=time, F=frequency bins, c=compression factor
+        T_reduced = sample_rate // (2 ** (len(channels)))  # Time after encoder
+        F_reduced = 3  # Frequency bins after WST reduction
+        computed_latent = int((T_reduced * F_reduced) ** 0.5 / compression_factor)
+        self.latent_dim = min(latent_dim, computed_latent)  # Use smaller of two values
+        
         self.latent_projection = ComplexConv2d(
             channels[-1],
-            latent_dim,
+            self.latent_dim,
             kernel_size=1
         )
         
@@ -122,7 +128,7 @@ class WSTVocoder(pl.LightningModule):
         # First decoder block from latent to first decoder channel
         self.decoder_blocks.append(
             DecoderBlock(
-                latent_dim,
+                self.latent_dim,
                 reversed_channels[0],  # First decoder channel (= channels[-1])
                 kernel_size,
                 stride,
@@ -210,7 +216,7 @@ class WSTVocoder(pl.LightningModule):
         Returns:
             Reconstructed audio tensor of shape (batch_size, time)
         """
-        # Apply WST
+        # Apply WST - output is now [B, 3, T, F] with reduced dimensions
         x_wst = self.wst(x.unsqueeze(1))
         
         # Convert to complex
@@ -220,7 +226,8 @@ class WSTVocoder(pl.LightningModule):
         x = self.initial_projection(x_complex)
         
         # Store encoder features for skip connections
-        encoder_features = [x]
+        encoder_features = []
+        encoder_features.append(x)  # Store initial feature
         
         # Encoder
         for block in self.encoder_blocks:
@@ -250,6 +257,11 @@ class WSTVocoder(pl.LightningModule):
                 
                 # Add skip connection
                 x = x + skip
+                
+            # Clear encoder features after use to save memory
+            if i > 0 and i < len(encoder_features):
+                # Delete reference to free memory
+                encoder_features[-(i)] = None
         
         # Output layer
         x = self.output_layer(x)
@@ -264,6 +276,9 @@ class WSTVocoder(pl.LightningModule):
         return x_out.squeeze(1)
     
     def training_step(self, batch, batch_idx):
+        # Free memory before processing batch
+        torch.cuda.empty_cache()
+        
         x = batch["audio"]
         x_hat = self(x)
         
@@ -279,6 +294,9 @@ class WSTVocoder(pl.LightningModule):
         return loss
     
     def validation_step(self, batch, batch_idx):
+        # Free memory before processing batch
+        torch.cuda.empty_cache()
+        
         x = batch["audio"]
         x_hat = self(x)
         
