@@ -4,8 +4,9 @@
 logs/
 datasets/
 results/
-usage.txt
+*.txt
 inference_test.py
 docs/
 *.png
 *.h5
+pretrained/
