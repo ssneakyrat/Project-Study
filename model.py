@@ -3,10 +3,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from complex_layers import (
-    ComplexConv1d, ComplexConvTranspose1d, ComplexBatchNorm1d, 
+    ComplexConv2d, ComplexConvTranspose2d, ComplexBatchNorm2d, 
     ComplexPReLU, ComplexToReal, RealToComplex
 )
 from wavelet_transform import WaveletScatteringTransform
+
+
+class EncoderBlock(nn.Module):
+    """Standardized encoder block to ensure consistent dimensions"""
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super().__init__()
+        self.conv = ComplexConv2d(in_channels, out_channels, kernel_size, stride, padding)
+        self.bn = ComplexBatchNorm2d(out_channels)
+        self.prelu = ComplexPReLU()
+        
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.prelu(x)
+        return x
+
+
+class DecoderBlock(nn.Module):
+    """Standardized decoder block to ensure consistent dimensions"""
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding):
+        super().__init__()
+        self.conv_transpose = ComplexConvTranspose2d(
+            in_channels, out_channels, kernel_size, stride, padding, output_padding)
+        self.bn = ComplexBatchNorm2d(out_channels)
+        self.prelu = ComplexPReLU()
+        
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.bn(x)
+        x = self.prelu(x)
+        return x
 
 
 class WSTVocoder(pl.LightningModule):
@@ -16,11 +47,11 @@ class WSTVocoder(pl.LightningModule):
                  wst_Q=8,
                  channels=[64, 128, 256],
                  latent_dim=64,
-                 kernel_sizes=[5, 5, 5],
-                 strides=[2, 2, 2],
+                 kernel_size=3,
+                 stride=2,
                  compression_factor=16,
                  learning_rate=1e-4):
-        """WST-based vocoder model.
+        """WST-based vocoder model with standardized dimensions.
         
         Args:
             sample_rate: Audio sample rate
@@ -28,8 +59,8 @@ class WSTVocoder(pl.LightningModule):
             wst_Q: Number of wavelets per octave for WST
             channels: List of channel dimensions for encoder/decoder
             latent_dim: Dimension of latent space
-            kernel_sizes: List of kernel sizes for encoder/decoder
-            strides: List of strides for encoder/decoder
+            kernel_size: Kernel size for all layers (int or tuple)
+            stride: Stride for all layers (int or tuple)
             compression_factor: Compression factor for latent dimension
             learning_rate: Learning rate for optimizer
         """
@@ -38,6 +69,16 @@ class WSTVocoder(pl.LightningModule):
         
         self.sample_rate = sample_rate
         self.learning_rate = learning_rate
+        
+        # Standardize kernel_size and stride to tuples
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        if isinstance(stride, int):
+            stride = (stride, stride)
+            
+        # Calculate padding based on kernel size
+        padding = (kernel_size[0] // 2, kernel_size[1] // 2)
+        output_padding = (stride[0] - 1, stride[1] - 1)
         
         # WST layer
         self.wst = WaveletScatteringTransform(
@@ -51,73 +92,115 @@ class WSTVocoder(pl.LightningModule):
         # Convert real audio to complex
         self.real_to_complex = RealToComplex(mode='zero_imag')
         
-        # Encoder
-        self.encoder_layers = nn.ModuleList()
-        # Approximate the number of channels from WST output
-        # This is a simplified estimation - in a real implementation we would need 
-        # to calculate this precisely based on J and Q values
-        in_channels = wst_Q * (wst_J + 1)  
+        # Initial projection to standardize WST output channels
+        self.initial_projection = ComplexConv2d(1, channels[0], kernel_size=1)
         
-        for i, (out_channels, kernel_size, stride) in enumerate(zip(channels, kernel_sizes, strides)):
-            self.encoder_layers.append(
-                nn.Sequential(
-                    ComplexConv1d(
-                        in_channels if i == 0 else channels[i-1],
-                        out_channels,
-                        kernel_size,
-                        stride=stride,
-                        padding=kernel_size // 2
-                    ),
-                    ComplexBatchNorm1d(out_channels),
-                    ComplexPReLU()
+        # Encoder blocks
+        self.encoder_blocks = nn.ModuleList()
+        for i in range(len(channels)-1):
+            self.encoder_blocks.append(
+                EncoderBlock(
+                    channels[i],
+                    channels[i+1],
+                    kernel_size,
+                    stride,
+                    padding
                 )
             )
         
         # Latent projection
-        self.latent_projection = ComplexConv1d(
+        self.latent_projection = ComplexConv2d(
             channels[-1],
             latent_dim,
             kernel_size=1
         )
         
-        # Decoder
-        self.decoder_layers = nn.ModuleList()
+        # Decoder blocks
+        self.decoder_blocks = nn.ModuleList()
+        reversed_channels = list(reversed(channels))
         
-        for i, (in_channels, out_channels, kernel_size, stride) in enumerate(
-            zip(
-                [latent_dim] + channels[:-1],
-                channels,
-                kernel_sizes,
-                strides
+        # First decoder block from latent to first decoder channel
+        self.decoder_blocks.append(
+            DecoderBlock(
+                latent_dim,
+                reversed_channels[0],  # First decoder channel (= channels[-1])
+                kernel_size,
+                stride,
+                padding,
+                output_padding
             )
-        ):
-            self.decoder_layers.append(
-                nn.Sequential(
-                    ComplexConvTranspose1d(
-                        in_channels,
-                        out_channels,
-                        kernel_size,
-                        stride=stride,
-                        padding=kernel_size // 2,
-                        output_padding=stride - 1
-                    ),
-                    ComplexBatchNorm1d(out_channels),
-                    ComplexPReLU()
+        )
+        
+        # Remaining decoder blocks
+        for i in range(len(reversed_channels)-1):
+            self.decoder_blocks.append(
+                DecoderBlock(
+                    reversed_channels[i],
+                    reversed_channels[i+1],
+                    kernel_size,
+                    stride,
+                    padding,
+                    output_padding
                 )
             )
         
+        # Skip connections (1×1 projections) to handle potential channel mismatches
+        self.skip_connections = nn.ModuleList()
+        # Skip from encoder output to first decoder block
+        self.skip_connections.append(
+            ComplexConv2d(channels[-1], reversed_channels[0], kernel_size=1) 
+            if channels[-1] != reversed_channels[0] else nn.Identity()
+        )
+        
+        # Remaining skip connections
+        for i in range(len(channels) - 1):
+            enc_ch = channels[-(i+2)]  # Going backwards from the second-to-last encoder layer
+            dec_ch = reversed_channels[i+1]  # Going forwards from the second decoder layer
+            
+            self.skip_connections.append(
+                ComplexConv2d(enc_ch, dec_ch, kernel_size=1) 
+                if enc_ch != dec_ch else nn.Identity()
+            )
+        
         # Output layer
-        self.output_layer = ComplexConvTranspose1d(
-            channels[-1],
+        self.output_layer = ComplexConvTranspose2d(
+            channels[0],  # Last decoder channel
             1,  # Output channels
-            kernel_size=kernel_sizes[0],
-            stride=strides[0],
-            padding=kernel_sizes[0] // 2,
-            output_padding=strides[0] - 1
+            kernel_size,
+            stride,
+            padding,
+            output_padding
         )
         
         # Convert complex back to real
         self.complex_to_real = ComplexToReal(mode='real')
+        
+    def _resize_feature_map(self, source, target):
+        """Resize source feature map to match target spatial dimensions"""
+        if source.shape[2:] == target.shape[2:]:
+            return source
+            
+        if torch.is_complex(source):
+            real_resized = F.interpolate(
+                source.real, 
+                size=target.shape[2:], 
+                mode='bilinear', 
+                align_corners=False
+            )
+            imag_resized = F.interpolate(
+                source.imag, 
+                size=target.shape[2:], 
+                mode='bilinear', 
+                align_corners=False
+            )
+            return torch.complex(real_resized, imag_resized)
+        else:
+            return F.interpolate(
+                source, 
+                size=target.shape[2:], 
+                mode='bilinear', 
+                align_corners=False
+            )
         
     def forward(self, x):
         """
@@ -133,38 +216,61 @@ class WSTVocoder(pl.LightningModule):
         # Convert to complex
         x_complex = self.real_to_complex(x_wst)
         
-        # Store skip connections
-        skip_connections = []
+        # Initial projection
+        x = self.initial_projection(x_complex)
+        
+        # Store encoder features for skip connections
+        encoder_features = [x]
         
         # Encoder
-        for layer in self.encoder_layers:
-            x_complex = layer(x_complex)
-            skip_connections.append(x_complex)
+        for block in self.encoder_blocks:
+            x = block(x)
+            encoder_features.append(x)
         
         # Latent space
-        z = self.latent_projection(x_complex)
+        z = self.latent_projection(x)
         
         # Decoder with skip connections
-        x_complex = z
+        x = z
         
-        for i, layer in enumerate(self.decoder_layers):
-            x_complex = layer(x_complex)
+        for i, block in enumerate(self.decoder_blocks):
+            # Apply decoder block
+            x = block(x)
             
-            # Add skip connection from encoder (except for the last decoder layer)
-            if i < len(self.decoder_layers) - 1:
-                x_complex = x_complex + skip_connections[-(i+1)]
+            # Add skip connection if not the output block
+            if i < len(self.skip_connections):
+                # Get the corresponding encoder feature map
+                skip_source = encoder_features[-(i+1)]
+                
+                # Apply channel projection if needed
+                skip = self.skip_connections[i](skip_source)
+                
+                # Resize to match spatial dimensions if needed
+                skip = self._resize_feature_map(skip, x)
+                
+                # Add skip connection
+                x = x + skip
         
         # Output layer
-        x_complex = self.output_layer(x_complex)
+        x = self.output_layer(x)
         
         # Convert to real
-        x_out = self.complex_to_real(x_complex)
+        x_out = self.complex_to_real(x)
+        
+        # Average over frequency dimension to get back to audio
+        # x_out shape is [batch_size, 1, time, freq]
+        x_out = x_out.mean(dim=3)
         
         return x_out.squeeze(1)
     
     def training_step(self, batch, batch_idx):
         x = batch["audio"]
         x_hat = self(x)
+        
+        # Ensure same length (WST might change the length)
+        min_len = min(x.shape[1], x_hat.shape[1])
+        x = x[:, :min_len]
+        x_hat = x_hat[:, :min_len]
         
         # L1 loss
         loss = F.l1_loss(x_hat, x)
@@ -176,6 +282,11 @@ class WSTVocoder(pl.LightningModule):
         x = batch["audio"]
         x_hat = self(x)
         
+        # Ensure same length (WST might change the length)
+        min_len = min(x.shape[1], x_hat.shape[1])
+        x = x[:, :min_len]
+        x_hat = x_hat[:, :min_len]
+        
         # L1 loss
         loss = F.l1_loss(x_hat, x)
         
@@ -185,48 +296,3 @@ class WSTVocoder(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         return optimizer
-
-
-class WSTVocoderLoss(nn.Module):
-    """Loss function for WST vocoder.
-    
-    Combines L1 loss, spectral loss, and potentially adversarial loss.
-    """
-    def __init__(self, alpha=1.0, beta=1.0, gamma=0.0):
-        """
-        Args:
-            alpha: Weight for L1 loss
-            beta: Weight for spectral loss
-            gamma: Weight for adversarial loss (if used)
-        """
-        super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        
-    def forward(self, x_hat, x, d_fake=None):
-        """
-        Args:
-            x_hat: Reconstructed audio
-            x: Original audio
-            d_fake: Discriminator output for fake audio (if using adversarial loss)
-        
-        Returns:
-            Weighted sum of losses
-        """
-        # L1 loss
-        l1_loss = F.l1_loss(x_hat, x)
-        
-        # Spectral loss (simplified for PoC)
-        # In a full implementation, we would use STFT loss
-        spec_loss = torch.tensor(0.0, device=x.device)
-        
-        # Adversarial loss (if using)
-        adv_loss = torch.tensor(0.0, device=x.device)
-        if d_fake is not None and self.gamma > 0:
-            adv_loss = F.mse_loss(d_fake, torch.ones_like(d_fake))
-        
-        # Total loss
-        total_loss = self.alpha * l1_loss + self.beta * spec_loss + self.gamma * adv_loss
-        
-        return total_loss

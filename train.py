@@ -16,6 +16,21 @@ def main(args):
         sr=args.sample_rate
     )
     
+    # Convert kernel_size and stride to tuples if needed
+    kernel_size = args.kernel_size
+    if isinstance(kernel_size, int):
+        kernel_size = (kernel_size, kernel_size)
+    else:
+        h, w = kernel_size.split('x')
+        kernel_size = (int(h), int(w))
+        
+    stride = args.stride
+    if isinstance(stride, int):
+        stride = (stride, stride)
+    else:
+        h, w = stride.split('x')
+        stride = (int(h), int(w))
+    
     # Create model
     model = WSTVocoder(
         sample_rate=args.sample_rate,
@@ -23,8 +38,8 @@ def main(args):
         wst_Q=args.wst_Q,
         channels=args.channels,
         latent_dim=args.latent_dim,
-        kernel_sizes=args.kernel_sizes,
-        strides=args.strides,
+        kernel_size=kernel_size,
+        stride=stride,
         compression_factor=args.compression_factor,
         learning_rate=args.learning_rate
     )
@@ -60,7 +75,7 @@ if __name__ == "__main__":
     # Data args
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--num_samples", type=int, default=1000)
+    parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--sample_length", type=int, default=32000)  # 2 seconds at 16kHz
     parser.add_argument("--sample_rate", type=int, default=16000)
     
@@ -69,8 +84,10 @@ if __name__ == "__main__":
     parser.add_argument("--wst_Q", type=int, default=8)
     parser.add_argument("--channels", type=int, nargs="+", default=[64, 128, 256])
     parser.add_argument("--latent_dim", type=int, default=64)
-    parser.add_argument("--kernel_sizes", type=int, nargs="+", default=[5, 5, 5])
-    parser.add_argument("--strides", type=int, nargs="+", default=[2, 2, 2])
+    parser.add_argument("--kernel_size", default=3, type=int,
+                       help="Kernel size (single int or 'HxW' format)")
+    parser.add_argument("--stride", default=2, type=int,
+                       help="Stride (single int or 'HxW' format)")
     parser.add_argument("--compression_factor", type=int, default=16)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     
