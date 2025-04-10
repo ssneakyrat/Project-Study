@@ -21,7 +21,7 @@ class WSTVocoder(pl.LightningModule):
                  latent_dim=None,  # Will be calculated dynamically
                  kernel_sizes=[5, 5, 5],
                  strides=[2, 2, 2],
-                 compression_factor=16,
+                 compression_factor=8,  # Reduced from 16 to 8 for less aggressive compression
                  learning_rate=1e-4):
         """WST-based vocoder model.
         
@@ -76,8 +76,8 @@ class WSTVocoder(pl.LightningModule):
         # Store original length for final upsampling
         self.original_length = sample_rate * 2
         
-        # Convert real audio to complex
-        self.real_to_complex = RealToComplex(mode='zero_imag')
+        # Convert real audio to complex - use 'hilbert' mode to better approximate phase
+        self.real_to_complex = RealToComplex(mode='hilbert')
         
         # Encoder
         self.encoder_layers = nn.ModuleList()
@@ -143,8 +143,8 @@ class WSTVocoder(pl.LightningModule):
             output_padding=strides[0] - 1
         )
         
-        # Phase-aware complex to real conversion
-        self.complex_to_real = ComplexToReal(mode='magnitude')
+        # Phase-aware complex to real conversion - CRITICAL CHANGE for phase preservation
+        self.complex_to_real = ComplexToReal(mode='phase_aware')
         
         # Skip projections from encoder outputs to decoder inputs
         encoder_channels = channels  # [64, 128, 256]
@@ -162,6 +162,9 @@ class WSTVocoder(pl.LightningModule):
         
         # Final temporal upsampling to match original audio length
         self.final_upsampling = nn.Upsample(size=sample_rate * 2, mode='linear', align_corners=False)
+        
+        # Energy scaling factor for output normalization - NEW
+        self.output_scale = nn.Parameter(torch.ones(1))
         
     def compute_expected_output_size(self, input_size, layers):
         """Calculate the expected output size after a series of conv/deconv layers."""
@@ -184,6 +187,9 @@ class WSTVocoder(pl.LightningModule):
         """
         batch_size = x.size(0)
         input_length = x.size(1)
+        
+        # Track input energy for later normalization - NEW
+        input_energy = torch.mean(x**2)
         
         # Apply WST - will return shape [B, C, T'] where C = combined scattering orders and coefficients
         # and T' is the time dimension after wavelet transform (usually smaller than input)
@@ -239,8 +245,8 @@ class WSTVocoder(pl.LightningModule):
                         skip_imag = F.pad(skip.imag, (0, pad_size))
                         skip = torch.complex(skip_real, skip_imag)
                 
-                # Add skip connection with scaling factor to avoid dominating the signal
-                x_complex = x_complex + 0.1 * skip
+                # Add skip connection with increased scaling factor to avoid losing signal - MODIFIED
+                x_complex = x_complex + 0.5 * skip  # Increased from 0.1 to 0.5
             
             # Apply decoder layer
             x_complex = layer(x_complex)
@@ -248,13 +254,19 @@ class WSTVocoder(pl.LightningModule):
         # Output layer
         x_complex = self.output_layer(x_complex)
         
-        # Convert to real using magnitude instead of just real part to preserve energy
+        # Convert to real using phase-aware mode to preserve energy
         x_out = self.complex_to_real(x_complex).squeeze(1)
         
         # The final output may still not match the original audio length
         # Use interpolation to match the exact input size
         if x_out.shape[1] != input_length:
             x_out = self.final_upsampling(x_out.unsqueeze(1)).squeeze(1)
+        
+        # Apply output energy normalization - NEW
+        output_energy = torch.mean(x_out**2) + 1e-8
+        energy_ratio = torch.sqrt(input_energy / output_energy)
+        # Use learnable scaling factor with energy ratio
+        x_out = x_out * self.output_scale * energy_ratio
             
         return x_out
     
@@ -281,12 +293,23 @@ class WSTVocoder(pl.LightningModule):
             torch.log1p(torch.abs(X_hat) + 1e-8)
         )
         
-        # Combined loss
-        loss = l1_loss + 0.1 * spec_loss
+        # Phase loss - NEW
+        # Compute phase difference and apply circular loss
+        phase_x = torch.angle(X)
+        phase_x_hat = torch.angle(X_hat)
+        # Circular difference for phase (handles 2π wrapping)
+        phase_diff = torch.abs(torch.remainder(phase_x - phase_x_hat + math.pi, 2 * math.pi) - math.pi)
+        # Weight by magnitude to focus on important frequencies
+        magnitude_weight = torch.abs(X) / (torch.abs(X).sum(dim=1, keepdim=True) + 1e-8)
+        phase_loss = torch.mean(magnitude_weight * phase_diff)
+        
+        # Combined loss with phase term
+        loss = l1_loss + 0.1 * spec_loss + 0.05 * phase_loss
         
         self.log('train_loss', loss)
         self.log('train_l1_loss', l1_loss)
         self.log('train_spec_loss', spec_loss)
+        self.log('train_phase_loss', phase_loss)
         
         return loss
     
@@ -313,12 +336,31 @@ class WSTVocoder(pl.LightningModule):
             torch.log1p(torch.abs(X_hat) + 1e-8)
         )
         
-        # Combined loss
-        loss = l1_loss + 0.1 * spec_loss
+        # Phase loss - NEW
+        # Compute phase difference and apply circular loss
+        phase_x = torch.angle(X)
+        phase_x_hat = torch.angle(X_hat)
+        # Circular difference for phase (handles 2π wrapping)
+        phase_diff = torch.abs(torch.remainder(phase_x - phase_x_hat + math.pi, 2 * math.pi) - math.pi)
+        # Weight by magnitude to focus on important frequencies
+        magnitude_weight = torch.abs(X) / (torch.abs(X).sum(dim=1, keepdim=True) + 1e-8)
+        phase_loss = torch.mean(magnitude_weight * phase_diff)
+        
+        # Combined loss with phase term
+        loss = l1_loss + 0.1 * spec_loss + 0.05 * phase_loss
         
         self.log('val_loss', loss)
         self.log('val_l1_loss', l1_loss)
         self.log('val_spec_loss', spec_loss)
+        self.log('val_phase_loss', phase_loss)
+        
+        # Calculate signal-to-noise ratio (SNR) - NEW
+        with torch.no_grad():
+            signal_power = torch.mean(x**2, dim=1)
+            noise_power = torch.mean((x - x_hat)**2, dim=1)
+            snr = 10 * torch.log10(signal_power / (noise_power + 1e-8))
+            mean_snr = torch.mean(snr)
+            self.log('val_snr_db', mean_snr)
         
         # Log audio and visualizations for first batch only to save computation
         if batch_idx == 0:
