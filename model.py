@@ -48,24 +48,23 @@ class WSTVocoder(pl.LightningModule):
             out_type='array'
         )
         
-        # Calculate input channels from scattering parameters
-        # Estimate number of coefficients based on J and Q for first and second order
-        # This is an approximation: first order ~ J*Q, second order ~ J*(J-1)/2
-        # Total coefficients = first order + second order + 1 (zeroth order)
-        estimated_wst_channels = wst_Q * wst_J + wst_J * (wst_J - 1) // 2 + 1
+        # Pre-compute actual WST output channels with a dummy input
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, 1, sample_rate * 2)
+            dummy_output = self.wst(dummy_input)
+            self.wst_channels = dummy_output.shape[1]
         
         # Convert real audio to complex
         self.real_to_complex = RealToComplex(mode='zero_imag')
         
         # Encoder
         self.encoder_layers = nn.ModuleList()
-        in_channels = estimated_wst_channels  
         
         for i, (out_channels, kernel_size, stride) in enumerate(zip(channels, kernel_sizes, strides)):
             self.encoder_layers.append(
                 nn.Sequential(
                     ComplexConv1d(
-                        in_channels if i == 0 else channels[i-1],
+                        self.wst_channels if i == 0 else channels[i-1],
                         out_channels,
                         kernel_size,
                         stride=stride,
@@ -77,9 +76,6 @@ class WSTVocoder(pl.LightningModule):
             )
         
         # Latent projection
-        # Calculate the bottleneck dimension based on our formula: d = √(T×F)/c
-        # For WST, F corresponds to number of scattering coefficients
-        # We'll estimate this based on our approximation and update in forward pass
         self.latent_projection = ComplexConv1d(
             channels[-1],
             latent_dim,
@@ -136,7 +132,7 @@ class WSTVocoder(pl.LightningModule):
         # Apply WST - will return shape [B, C, T] where C = combined scattering orders and coefficients
         x_wst = self.wst(x.unsqueeze(1))
         
-        # Check the actual shape
+        # Log shape information
         B, C, T = x_wst.shape
         self.log("wst_channels", C, on_step=True)
         self.log("wst_timesteps", T, on_step=True)
