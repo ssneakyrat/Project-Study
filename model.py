@@ -26,10 +26,11 @@ class WaveletAEModel(LightningModule):
         dummy_input = torch.zeros(1, 1, segment_length)
         with torch.no_grad():
             wavelet_output = self.wavelet(dummy_input)
-        wavelet_channels = wavelet_output.shape[1]
         
-        # Ensure even channel dimension for complex tensor conversion
-        self.input_channels = wavelet_channels // 2
+        # Get shape information for reshaping
+        self.wavelet_dims = wavelet_output.shape
+        self.input_channels = wavelet_output.numel() // (wavelet_output.shape[0] * wavelet_output.shape[-1])
+        self.seq_length = wavelet_output.shape[-1]
         
         # Encoder and decoder
         self.encoder = ComplexEncoder(self.input_channels, encoder_dims)
@@ -49,20 +50,25 @@ class WaveletAEModel(LightningModule):
         """
         # Apply wavelet transform
         x_wavelet = self.wavelet(x)
+        batch_size = x_wavelet.shape[0]
+        
+        # Reshape from [batch, channels, dim1, dim2] to [batch, channels*dim1, dim2]
+        # Flatten all dimensions except batch and last dimension (time/sequence)
+        x_reshaped = x_wavelet.reshape(batch_size, -1, self.seq_length)
         
         # Ensure even number of channels for complex tensor
-        n_channels = x_wavelet.shape[1]
+        n_channels = x_reshaped.shape[1]
         if n_channels % 2 != 0:
             # If odd number, pad with zeros to make even
-            pad = torch.zeros_like(x_wavelet[:, :1])
-            x_wavelet = torch.cat([x_wavelet, pad], dim=1)
+            pad = torch.zeros_like(x_reshaped[:, :1])
+            x_reshaped = torch.cat([x_reshaped, pad], dim=1)
             n_channels += 1
         
         # Make complex by splitting channels
         half_channels = n_channels // 2
         x_complex = ComplexTensor(
-            x_wavelet[:, :half_channels], 
-            x_wavelet[:, half_channels:]
+            x_reshaped[:, :half_channels], 
+            x_reshaped[:, half_channels:]
         )
         
         # Encode

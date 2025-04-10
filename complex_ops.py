@@ -44,18 +44,32 @@ class ComplexConvTranspose1d(nn.Module):
 class ComplexLayerNorm(nn.Module):
     def __init__(self, normalized_shape):
         super().__init__()
-        self.norm_real = nn.LayerNorm(normalized_shape)
-        self.norm_imag = nn.LayerNorm(normalized_shape)
+        self.normalized_shape = normalized_shape
         
     def forward(self, x):
-        """Apply layer normalization to real and imaginary parts separately"""
+        """
+        Apply layer normalization to real and imaginary parts separately,
+        properly handling 1D convolutional inputs (batch, channels, length)
+        """
         if not isinstance(x, ComplexTensor):
-            return self.norm_real(x)
+            # For 1D convolutional inputs, normalize along the channel dimension
+            # x shape: [batch, channels, length]
+            mean = x.mean(dim=1, keepdim=True)
+            var = x.var(dim=1, keepdim=True, unbiased=False)
+            normalized = (x - mean) / torch.sqrt(var + 1e-5)
+            return normalized
             
-        real_part = self.norm_real(x.real)
-        imag_part = self.norm_imag(x.imag)
+        # For complex inputs, normalize real and imaginary parts separately
+        # Each part shape: [batch, channels, length]
+        real_mean = x.real.mean(dim=1, keepdim=True)
+        real_var = x.real.var(dim=1, keepdim=True, unbiased=False)
+        real_normalized = (x.real - real_mean) / torch.sqrt(real_var + 1e-5)
         
-        return ComplexTensor(real_part, imag_part)
+        imag_mean = x.imag.mean(dim=1, keepdim=True)
+        imag_var = x.imag.var(dim=1, keepdim=True, unbiased=False)
+        imag_normalized = (x.imag - imag_mean) / torch.sqrt(imag_var + 1e-5)
+        
+        return ComplexTensor(real_normalized, imag_normalized)
 
 def complex_leaky_relu(x, negative_slope=0.2):
     """
