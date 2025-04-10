@@ -123,11 +123,19 @@ class WSTVocoder(pl.LightningModule):
         # Convert complex back to real
         self.complex_to_real = ComplexToReal(mode='real')
         
-        # Create skip projection layers in init (not lazily)
-        self.skip_projections = nn.ModuleList([
-            ComplexConv1d(ch_in, ch_out, kernel_size=1) 
-            for ch_in, ch_out in zip(reversed(self.channels), [self.latent_dim] + self.channels[:-1])
-        ])
+        # Skip projections from encoder outputs to decoder inputs
+        encoder_channels = channels  # [64, 128, 256]
+        decoder_input_channels = [latent_dim] + channels[:-1]  # [64, 64, 128]
+        
+        self.skip_projections = nn.ModuleList()
+        for i in range(len(encoder_channels)):
+            enc_ch = encoder_channels[i]
+            dec_idx = len(decoder_input_channels) - 1 - i
+            dec_ch = decoder_input_channels[dec_idx]
+            
+            self.skip_projections.append(
+                ComplexConv1d(enc_ch, dec_ch, kernel_size=1)
+            )
         
     def forward(self, x):
         """
@@ -163,14 +171,13 @@ class WSTVocoder(pl.LightningModule):
         x_complex = z
         
         for i, layer in enumerate(self.decoder_layers):
-            x_complex = layer(x_complex)
-            
-            # Add skip connection from encoder (except for the last decoder layer)
-            if i < len(self.decoder_layers) - 1:
-                skip = skip_connections[-(i+1)]
+            # Add skip connection before decoder layer
+            skip_idx = len(skip_connections) - 1 - i
+            if skip_idx >= 0:
+                skip = skip_connections[skip_idx]
                 
-                # Project channels to match decoder output
-                skip = self.skip_projections[i](skip)
+                # Project channels to match decoder input
+                skip = self.skip_projections[skip_idx](skip)
                 
                 # Resize time dimension if needed using interpolation
                 if skip.shape[2] != x_complex.shape[2]:
@@ -178,7 +185,11 @@ class WSTVocoder(pl.LightningModule):
                     skip_imag = F.interpolate(skip.imag, size=x_complex.shape[2], mode='linear', align_corners=False)
                     skip = torch.complex(skip_real, skip_imag)
                 
+                # Add skip connection
                 x_complex = x_complex + skip
+            
+            # Apply decoder layer
+            x_complex = layer(x_complex)
         
         # Output layer
         x_complex = self.output_layer(x_complex)
