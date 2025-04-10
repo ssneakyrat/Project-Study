@@ -45,7 +45,12 @@ class ComplexConv1d(nn.Module):
         else:  # Handle the case where input is real
             x_real, x_imag = x, torch.zeros_like(x)
         
-        # Fix 2: Add dimension verification in ComplexConv1d.forward()
+        # First handle extra dimensions - move this BEFORE the channel check
+        if x_real.dim() == 4:
+            x_real = x_real.squeeze(2)
+            x_imag = x_imag.squeeze(2)
+        
+        # Then check channel dimensions
         if x_real.size(1) != self.in_channels:
             raise ValueError(f"Expected {self.in_channels} channels, got {x_real.size(1)}. Shape: {x_real.shape}")
         

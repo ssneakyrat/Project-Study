@@ -106,10 +106,14 @@ class WaveletScatteringTransform(nn.Module):
         
         # Check the shape for debugging
         print(f"After normalization - Real: {real_part.shape}, Imag: {imag_part.shape}")
+        
+        if real_part.dim() == 4:
+            real_part = real_part.squeeze(2)
+            imag_part = imag_part.squeeze(2)
 
         # Print final shape for debugging
         print(f"Final WST output - Real: {real_part.shape}, Imag: {imag_part.shape}")
-        
+
         return (real_part, imag_part)
 
 class ParametricWaveletTransform(nn.Module):

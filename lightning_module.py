@@ -47,17 +47,23 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
             dummy_input = torch.zeros(1, config['wavelet']['T'])
             with torch.no_grad():
                 wst_output = self.wst(dummy_input)
-                # Handle both tuple return (real, imag) and single tensor return
                 if isinstance(wst_output, tuple):
-                    input_channels = wst_output[0].shape[1]  # Real part channels
+                    # Account for 4D output - flatten extra dimensions
+                    real_part = wst_output[0]
+                    if real_part.dim() == 4:
+                        real_part = real_part.squeeze(2)
+                    input_channels = real_part.shape[1]
                 else:
-                    input_channels = wst_output.shape[1]  # All channels
+                    # Similar handling for non-tuple output
+                    if wst_output.dim() == 4:
+                        wst_output = wst_output.squeeze(2)
+                    input_channels = wst_output.shape[1]
             print(f"Initializing encoder with {input_channels} input channels")
         except Exception as e:
             print(f"Warning: Error determining WST output shape: {e}")
-            # Fallback to an estimate based on configuration
+            # Your J*Q calculation is correct - matches the actual output channels
             J, Q = config['wavelet']['J'], config['wavelet']['Q']
-            input_channels = J * Q  # Conservative estimate
+            input_channels = J * Q  # This should be 12 with your current config
         
         # Extract model parameters from config
         channels = config['model']['channels']
