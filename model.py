@@ -123,6 +123,12 @@ class WSTVocoder(pl.LightningModule):
         # Convert complex back to real
         self.complex_to_real = ComplexToReal(mode='real')
         
+        # Create skip projection layers in init (not lazily)
+        self.skip_projections = nn.ModuleList([
+            ComplexConv1d(ch_in, ch_out, kernel_size=1) 
+            for ch_in, ch_out in zip(reversed(self.channels), [self.latent_dim] + self.channels[:-1])
+        ])
+        
     def forward(self, x):
         """
         Args:
@@ -156,13 +162,6 @@ class WSTVocoder(pl.LightningModule):
         # Decoder with skip connections
         x_complex = z
         
-        # Create projection layers for skip connections if needed (lazily)
-        if not hasattr(self, 'skip_projections'):
-            self.skip_projections = nn.ModuleList([
-                ComplexConv1d(ch_in, ch_out, kernel_size=1) 
-                for ch_in, ch_out in zip(reversed(self.channels), [self.latent_dim] + self.channels[:-1])
-            ])
-        
         for i, layer in enumerate(self.decoder_layers):
             x_complex = layer(x_complex)
             
@@ -170,7 +169,7 @@ class WSTVocoder(pl.LightningModule):
             if i < len(self.decoder_layers) - 1:
                 skip = skip_connections[-(i+1)]
                 
-                # Project channels to match decoder output if needed
+                # Project channels to match decoder output
                 skip = self.skip_projections[i](skip)
                 
                 # Resize time dimension if needed using interpolation
