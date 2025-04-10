@@ -19,10 +19,18 @@ class WaveletScatteringTransform(nn.Module):
             out_type: Output format
         """
         super().__init__()
-        self.scattering = Scattering1D(J=J, shape=T, Q=Q, max_order=max_order, out_type=out_type)
         self.J = J
         self.Q = Q
         self.T = T
+        self.max_order = max_order
+        self.out_type = out_type
+        self._create_scattering()
+        
+    def _create_scattering(self, T=None):
+        """Create or recreate scattering object with possibly updated T"""
+        T = T if T is not None else self.T
+        self.scattering = Scattering1D(J=self.J, shape=T, Q=self.Q, 
+                                      max_order=self.max_order, out_type=self.out_type)
         
     def forward(self, x):
         """
@@ -35,9 +43,36 @@ class WaveletScatteringTransform(nn.Module):
         # Ensure input has the right shape
         if x.dim() == 2:
             x = x.unsqueeze(1)
+            
+        # Check if we need to adapt to a different signal length
+        current_T = x.shape[-1]
+        expected_T = self.T
         
-        # Apply scattering transform
-        Sx = self.scattering(x)
+        # If signal is too short, pad it
+        if current_T < expected_T:
+            pad_size = expected_T - current_T
+            x = torch.nn.functional.pad(x, (0, pad_size))
+            
+        # If signal length doesn't match scattering expectation, recreate scattering
+        if current_T != expected_T and current_T > self.J * (2**self.J):
+            # Only update if signal is long enough for the current J value
+            self._create_scattering(current_T)
+            self.T = current_T
+        
+        try:
+            # Apply scattering transform
+            Sx = self.scattering(x)
+        except ValueError as e:
+            if "Indefinite padding size" in str(e):
+                # Handle case where signal is too short for current J
+                # Reduce J and recreate scattering
+                reduced_J = max(1, self.J - 1)
+                temp_scattering = Scattering1D(J=reduced_J, shape=current_T, 
+                                              Q=self.Q, max_order=self.max_order, 
+                                              out_type=self.out_type)
+                Sx = temp_scattering(x)
+            else:
+                raise e
         
         # Original shape from Kymatio: [batch_size, channels, time, frequency]
         B, C, T, F = Sx.shape

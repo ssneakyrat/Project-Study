@@ -85,9 +85,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
     # Data args
-    parser.add_argument("--batch_size", type=int, default=8)  # Reduced from 16
-    parser.add_argument("--num_workers", type=int, default=2)  # Reduced from 4
-    parser.add_argument("--num_samples", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=16)  # Reduced from 16
+    parser.add_argument("--num_workers", type=int, default=4)  # Reduced from 4
+    parser.add_argument("--num_samples", type=int, default=1000)
     parser.add_argument("--sample_length", type=int, default=16000)  # Reduced from 32000 (1 sec instead of 2)
     parser.add_argument("--sample_rate", type=int, default=16000)
     

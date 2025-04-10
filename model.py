@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import matplotlib.pyplot as plt
+import numpy as np
 from complex_layers import (
     ComplexConv2d, ComplexConvTranspose2d, ComplexBatchNorm2d, 
     ComplexPReLU, ComplexToReal, RealToComplex
@@ -309,6 +311,68 @@ class WSTVocoder(pl.LightningModule):
         loss = F.l1_loss(x_hat, x)
         
         self.log('val_loss', loss)
+        
+        # Log visualizations to TensorBoard (only for the first batch to save memory)
+        if batch_idx == 0:
+            # Select a few samples from the batch
+            num_samples = min(2, x.shape[0])
+            
+            for i in range(num_samples):
+                # Convert tensors to numpy arrays
+                x_np = x[i].cpu().numpy()
+                x_hat_np = x_hat[i].cpu().numpy()
+                
+                # Log input audio waveform
+                fig_in = plt.figure(figsize=(10, 4))
+                plt.plot(x_np)
+                plt.title(f"Input Audio {i}")
+                plt.tight_layout()
+                self.logger.experiment.add_figure(f"input_audio_{i}", fig_in, self.current_epoch)
+                plt.close(fig_in)
+                
+                # Log output audio waveform
+                fig_out = plt.figure(figsize=(10, 4))
+                plt.plot(x_hat_np)
+                plt.title(f"Reconstructed Audio {i}")
+                plt.tight_layout()
+                self.logger.experiment.add_figure(f"reconstructed_audio_{i}", fig_out, self.current_epoch)
+                plt.close(fig_out)
+                
+                # Log spectrograms
+                fig_spec_in = plt.figure(figsize=(10, 4))
+                plt.specgram(x_np, NFFT=1024, Fs=self.sample_rate, noverlap=512, cmap='viridis')
+                plt.colorbar(format='%+2.0f dB')
+                plt.title(f'Input Spectrogram {i}')
+                plt.tight_layout()
+                self.logger.experiment.add_figure(f'input_spectrogram_{i}', fig_spec_in, self.current_epoch)
+                plt.close(fig_spec_in)
+                
+                fig_spec_out = plt.figure(figsize=(10, 4))
+                plt.specgram(x_hat_np, NFFT=1024, Fs=self.sample_rate, noverlap=512, cmap='viridis')
+                plt.colorbar(format='%+2.0f dB')
+                plt.title(f'Output Spectrogram {i}')
+                plt.tight_layout()
+                self.logger.experiment.add_figure(f'output_spectrogram_{i}', fig_spec_out, self.current_epoch)
+                plt.close(fig_spec_out)
+            
+            # Generate and visualize WST coefficients for one sample
+            sample_idx = 0
+            x_wst = self.wst(x[sample_idx:sample_idx+1].unsqueeze(1))
+            
+            # Get magnitudes of WST coefficients if complex
+            wst_vis = x_wst.abs() if torch.is_complex(x_wst) else x_wst
+            
+            for i in range(x_wst.shape[1]):  # For each of the 3 channels (low, mid, high freq)
+                wst_band = wst_vis[0, i].cpu().numpy()
+                
+                fig_wst = plt.figure(figsize=(10, 4))
+                plt.imshow(wst_band, aspect='auto', origin='lower', cmap='viridis')
+                plt.colorbar()
+                plt.title(f'WST Coefficient Channel {i}')
+                plt.tight_layout()
+                self.logger.experiment.add_figure(f'wst_channel_{i}', fig_wst, self.current_epoch)
+                plt.close(fig_wst)
+        
         return loss
     
     def configure_optimizers(self):
