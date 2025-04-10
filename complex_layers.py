@@ -121,7 +121,7 @@ class ComplexPReLU(nn.Module):
 
 
 class ComplexToReal(nn.Module):
-    def __init__(self, mode='polar'):
+    def __init__(self, mode='coherent_polar'):
         """Convert complex tensor to real tensor.
         
         Args:
@@ -131,6 +131,8 @@ class ComplexToReal(nn.Module):
                 - 'imag': imaginary part only
                 - 'phase_aware': real * cos(phase) for better phase preservation
                 - 'polar': Uses both magnitude and phase information
+                - 'coherent_polar': Enhanced polar with unwrapped phase for continuity
+                - 'interleaved': Interleaves real and imaginary parts
         """
         super().__init__()
         self.mode = mode
@@ -162,12 +164,73 @@ class ComplexToReal(nn.Module):
             # Scale phase to same range as magnitude for balanced learning
             phase_scaled = phase / torch.pi
             return torch.cat([magnitude, phase_scaled], dim=1)
+        elif self.mode == 'coherent_polar':
+            # Enhanced polar representation with unwrapped phase for continuity
+            magnitude = torch.abs(x)
+            
+            # Get phase and unwrap along time dimension for continuity
+            phase = torch.angle(x)  # Range: [-π, π]
+            
+            # Unwrap phase along time dimension (approximate approach)
+            # Calculate phase differences
+            phase_diff = phase[:, :, 1:] - phase[:, :, :-1]
+            
+            # Find jumps (where abs diff > π)
+            jumps = torch.abs(phase_diff) > torch.pi
+            
+            # Create cumulative jump correction
+            correction = torch.zeros_like(phase)
+            
+            # Apply corrections where jumps occur
+            # This is a simplified version - can be improved with a proper unwrap algorithm
+            for i in range(1, phase.shape[2]):
+                # Where diff > π, subtract 2π; where diff < -π, add 2π
+                correction[:, :, i] = correction[:, :, i-1]
+                correction[:, :, i] = torch.where(
+                    phase_diff[:, :, i-1] < -torch.pi,
+                    correction[:, :, i] + 2*torch.pi,
+                    correction[:, :, i]
+                )
+                correction[:, :, i] = torch.where(
+                    phase_diff[:, :, i-1] > torch.pi,
+                    correction[:, :, i] - 2*torch.pi,
+                    correction[:, :, i]
+                )
+            
+            # Apply correction to phase
+            unwrapped_phase = phase + correction
+            
+            # Scale unwrapped phase and normalize for better training
+            # Use adaptive scaling based on the range of unwrapped phase values
+            phase_min = torch.min(unwrapped_phase, dim=2, keepdim=True)[0]
+            phase_max = torch.max(unwrapped_phase, dim=2, keepdim=True)[0]
+            phase_range = phase_max - phase_min + 1e-8
+            
+            # Normalize to [0, 1] range for better numerical stability
+            phase_norm = (unwrapped_phase - phase_min) / phase_range
+            
+            # Return concatenated magnitude and normalized unwrapped phase
+            return torch.cat([magnitude, phase_norm], dim=1)
+        elif self.mode == 'interleaved':
+            # Interleave real and imaginary parts along channel dimension
+            real, imag = x.real, x.imag
+            B, C, T = real.shape
+            real_reshaped = real.view(B, C, 1, T).expand(B, C, 2, T)
+            imag_reshaped = imag.view(B, C, 1, T).expand(B, C, 2, T)
+            
+            # Assign interleaved values - real at index 0, imag at index 1
+            interleaved = torch.zeros(B, C, 2, T, device=x.device)
+            interleaved[:, :, 0, :] = real_reshaped[:, :, 0, :]
+            interleaved[:, :, 1, :] = imag_reshaped[:, :, 0, :]
+            
+            # Reshape to [B, 2*C, T]
+            return interleaved.reshape(B, 2*C, T)
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
 
 class RealToComplex(nn.Module):
-    def __init__(self, mode='analytic'):
+    def __init__(self, mode='phase_corrected'):
         """Convert real tensor to complex tensor.
         
         Args:
@@ -178,6 +241,8 @@ class RealToComplex(nn.Module):
                 - 'hilbert': attempt to recover phase using Hilbert transform
                 - 'analytic': improved analytic signal approach
                 - 'polar': expects concatenated [magnitude, phase] channels
+                - 'phase_corrected': enhanced polar with adaptive phase unwrapping
+                - 'interleaved': expects interleaved real/imag values
         """
         super().__init__()
         self.mode = mode
@@ -213,6 +278,71 @@ class RealToComplex(nn.Module):
             imag_part = magnitude * torch.sin(phase)
             
             return torch.complex(real_part, imag_part)
+        elif self.mode == 'phase_corrected':
+            # For WST output (single channel groups), handle differently than polar data
+            channels = x.size(1)
+            if channels % 2 != 0:
+                # Handle odd number of channels from WST output
+                # Use analytic signal approach instead of polar for odd-channel input
+                return self._analytic_signal_transform(x)
+            
+            half_channels = channels // 2
+            magnitude = x[:, :half_channels]
+            phase_norm = x[:, half_channels:]
+            
+            # Apply adaptive phase reconstruction
+            # Convert normalized phase back to continuous phase using gradient consistency
+            
+            # Calculate approximate gradient of phase
+            phase_grad = torch.zeros_like(phase_norm)
+            phase_grad[:, :, 1:] = phase_norm[:, :, 1:] - phase_norm[:, :, :-1]
+            
+            # Identify large jumps (phase discontinuities)
+            jump_threshold = 0.5  # Normalized phase jump threshold
+            jumps = torch.abs(phase_grad) > jump_threshold
+            
+            # Create signal with better phase continuity
+            phase_smooth = phase_norm.clone()
+            for i in range(1, phase_norm.shape[2]):
+                # If jump detected, adjust phase
+                phase_smooth[:, :, i:] = torch.where(
+                    jumps[:, :, i-1:i],
+                    phase_smooth[:, :, i:] - torch.sign(phase_grad[:, :, i-1:i]) * 1.0,
+                    phase_smooth[:, :, i:]
+                )
+            
+            # Scale back to radians [-π, π] with smoothing
+            phase = phase_smooth * 2 * torch.pi - torch.pi
+            
+            # Apply additional phase smoothing along time with a small window
+            kernel_size = 3
+            padding = kernel_size // 2
+            phase_smoothed = F.avg_pool1d(phase, kernel_size=kernel_size, stride=1, padding=padding)
+            
+            # Blend original and smoothed phase
+            blend_factor = 0.7  # Higher values preserve original phase details
+            phase_final = blend_factor * phase + (1 - blend_factor) * phase_smoothed
+            
+            # Convert to complex using polar form
+            real_part = magnitude * torch.cos(phase_final)
+            imag_part = magnitude * torch.sin(phase_final)
+            
+            return torch.complex(real_part, imag_part)
+        elif self.mode == 'interleaved':
+            # Input is expected to be interleaved real/imag values
+            # Shape: [B, 2*C, T] → [B, C, T] complex
+            channels = x.size(1)
+            assert channels % 2 == 0, "Channel dimension must be even for interleaved mode"
+            
+            # Reshape to separate real and imaginary parts
+            B, C, T = x.shape
+            reshaped = x.view(B, C//2, 2, T)
+            
+            # Extract real and imaginary parts
+            real_part = reshaped[:, :, 0, :]
+            imag_part = reshaped[:, :, 1, :]
+            
+            return torch.complex(real_part, imag_part)
         elif self.mode == 'analytic':
             # Improved analytic signal approach using FFT for Hilbert transform
             batch_size, channels, length = x.shape
@@ -238,7 +368,17 @@ class RealToComplex(nn.Module):
             real_part = x
             imag_part = torch.fft.irfft(1j * X_fft * h_imag, dim=2, n=length)
             
-            return torch.complex(real_part, imag_part)
+            # Add phase consistency constraint
+            # Apply smoothness constraint to imaginary part using temporal smoothing
+            kernel_size = 5
+            padding = kernel_size // 2
+            imag_smoothed = F.avg_pool1d(imag_part, kernel_size=kernel_size, stride=1, padding=padding)
+            
+            # Blend original and smoothed imaginary parts for better phase continuity
+            alpha = 0.8  # Balance between original and smoothed
+            imag_part_final = alpha * imag_part + (1 - alpha) * imag_smoothed
+            
+            return torch.complex(real_part, imag_part_final)
         elif self.mode == 'hilbert':
             # Original implementation
             X = torch.fft.rfft(x, dim=-1)
