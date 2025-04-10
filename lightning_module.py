@@ -148,7 +148,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
         # Print output shape for debugging
         if isinstance(wst_output, tuple):
             real, imag = wst_output
-            print(f"WST output dimensions: Real {real.shape}, Imag {imag.shape}")
+            #print(f"WST output dimensions: Real {real.shape}, Imag {imag.shape}")
             
             # ENSURE WST OUTPUT IS IN [B, C, T] FORMAT
             # Get expected input channels for first encoder layer
@@ -162,7 +162,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
             
             # 2. Adapt channels if needed using a channel projection
             if real.size(1) != expected_channels:
-                print(f"Creating channel projection from {real.size(1)} to {expected_channels}")
+                #print(f"Creating channel projection from {real.size(1)} to {expected_channels}")
                 
                 # Create a channel projection (1x1 convolution)
                 channel_proj = nn.Conv1d(
@@ -177,7 +177,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
                 real = channel_proj(real)
                 imag = channel_proj(imag)
                 
-                print(f"WST output after adaptation: Real {real.shape}, Imag {real.shape}")
+                #print(f"WST output after adaptation: Real {real.shape}, Imag {real.shape}")
             
             # Update wst_output with properly shaped tensors
             wst_output = (real, imag)

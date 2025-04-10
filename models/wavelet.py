@@ -95,7 +95,7 @@ class WaveletScatteringTransform(nn.Module):
         elif current_length > target_length:
             # For longer signals, segment processing would be better
             # but for this fix we'll truncate and note the issue
-            print(f"Warning: Input signal length {current_length} exceeds target {target_length}.")
+            #print(f"Warning: Input signal length {current_length} exceeds target {target_length}.")
             x = x[:, :, :target_length]
             # Still apply optimal padding
             x = F.pad(x, (0, pad_length))
@@ -115,7 +115,7 @@ class WaveletScatteringTransform(nn.Module):
         x = x.contiguous()  # Ensure tensor is memory-contiguous
         Sx = self.scattering(x)
         
-        print(f"Raw scattering output shape: {Sx.shape}")
+        #print(f"Raw scattering output shape: {Sx.shape}")
         
         # Standardize format to [batch_size, channels, time]
         if Sx.dim() == 4:
@@ -123,7 +123,7 @@ class WaveletScatteringTransform(nn.Module):
             # Reshape to [batch, order*coeff, time]
             B, O, C, T = Sx.shape
             Sx = Sx.reshape(B, O*C, T)
-            print(f"Reshaped scattering output: {Sx.shape}")
+            #print(f"Reshaped scattering output: {Sx.shape}")
         elif Sx.dim() == 3:
             # Check if format is [batch, time, channels] and transpose if needed
             if Sx.size(1) == self.expected_output_time_dim and Sx.size(2) != self.expected_output_time_dim:
@@ -151,7 +151,7 @@ class WaveletScatteringTransform(nn.Module):
             imag_part = imag_part / (std_value + self.eps) * 0.1
         
         # Print final dimensions for debugging
-        print(f"Final WST output - Real: {real_part.shape}, Imag: {imag_part.shape}")
+        #print(f"Final WST output - Real: {real_part.shape}, Imag: {imag_part.shape}")
         
         # Verify shape is correct before returning
         assert real_part.size(1) != self.expected_output_time_dim, "WST output has incorrect dimension format!"
