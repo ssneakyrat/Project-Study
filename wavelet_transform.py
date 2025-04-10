@@ -30,7 +30,7 @@ class WaveletScatteringTransform(nn.Module):
             x: Input tensor of shape (batch_size, 1, T)
         
         Returns:
-            Scattering coefficients
+            Scattering coefficients reshaped for complex CNN
         """
         # Ensure input has the right shape
         if x.dim() == 2:
@@ -39,16 +39,11 @@ class WaveletScatteringTransform(nn.Module):
         # Apply scattering transform
         Sx = self.scattering(x)
         
-        # Reshape for the complex CNN
-        # The output of the scattering transform is a 3D tensor with shape (batch, channels, time)
-        # We need to reshape it to be compatible with our complex CNN
-        B = Sx.shape[0]  # Batch size
+        # Reshape the output for the complex CNN
+        # Kymatio outputs [batch, order, coef, time] but we need [batch, channels, time]
+        if Sx.dim() == 4:
+            # Combine order and coef dimensions
+            B, O, C, T = Sx.shape
+            Sx = Sx.reshape(B, O * C, T)
         
-        # Get the number of channels from the scattering transform output
-        C = Sx.shape[1]
-        
-        # Time dimension (if out_type is 'array')
-        T = Sx.shape[2]
-        
-        # Return as a tensor ready for the complex CNN
         return Sx

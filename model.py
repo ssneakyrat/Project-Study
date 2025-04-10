@@ -48,15 +48,18 @@ class WSTVocoder(pl.LightningModule):
             out_type='array'
         )
         
+        # Calculate input channels from scattering parameters
+        # Estimate number of coefficients based on J and Q for first and second order
+        # This is an approximation: first order ~ J*Q, second order ~ J*(J-1)/2
+        # Total coefficients = first order + second order + 1 (zeroth order)
+        estimated_wst_channels = wst_Q * wst_J + wst_J * (wst_J - 1) // 2 + 1
+        
         # Convert real audio to complex
         self.real_to_complex = RealToComplex(mode='zero_imag')
         
         # Encoder
         self.encoder_layers = nn.ModuleList()
-        # Approximate the number of channels from WST output
-        # This is a simplified estimation - in a real implementation we would need 
-        # to calculate this precisely based on J and Q values
-        in_channels = wst_Q * (wst_J + 1)  
+        in_channels = estimated_wst_channels  
         
         for i, (out_channels, kernel_size, stride) in enumerate(zip(channels, kernel_sizes, strides)):
             self.encoder_layers.append(
@@ -74,6 +77,9 @@ class WSTVocoder(pl.LightningModule):
             )
         
         # Latent projection
+        # Calculate the bottleneck dimension based on our formula: d = √(T×F)/c
+        # For WST, F corresponds to number of scattering coefficients
+        # We'll estimate this based on our approximation and update in forward pass
         self.latent_projection = ComplexConv1d(
             channels[-1],
             latent_dim,
@@ -127,8 +133,13 @@ class WSTVocoder(pl.LightningModule):
         Returns:
             Reconstructed audio tensor of shape (batch_size, time)
         """
-        # Apply WST
+        # Apply WST - will return shape [B, C, T] where C = combined scattering orders and coefficients
         x_wst = self.wst(x.unsqueeze(1))
+        
+        # Check the actual shape
+        B, C, T = x_wst.shape
+        self.log("wst_channels", C, on_step=True)
+        self.log("wst_timesteps", T, on_step=True)
         
         # Convert to complex
         x_complex = self.real_to_complex(x_wst)
