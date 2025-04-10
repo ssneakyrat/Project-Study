@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import matplotlib.pyplot as plt
+import numpy as np
 from complex_layers import (
     ComplexConv1d, ComplexConvTranspose1d, ComplexBatchNorm1d, 
     ComplexPReLU, ComplexToReal, RealToComplex
@@ -256,6 +258,120 @@ class WSTVocoder(pl.LightningModule):
         loss = F.l1_loss(x_hat, x)
         
         self.log('val_loss', loss)
+        
+        # Log audio and visualizations for first batch only to save computation
+        if batch_idx == 0:
+            # Log a few samples (e.g., first 4 in batch)
+            num_samples = min(4, x.size(0))
+            
+            # Create figure for waveform comparison
+            fig, axes = plt.subplots(num_samples, 2, figsize=(12, 3 * num_samples))
+            
+            # Handle case where num_samples = 1
+            if num_samples == 1:
+                axes = np.array([axes])
+            
+            for i in range(num_samples):
+                # Original waveform
+                axes[i, 0].plot(x[i].cpu().numpy())
+                axes[i, 0].set_title(f"Original Audio {i+1}")
+                axes[i, 0].set_ylim(-1.1, 1.1)
+                
+                # Reconstructed waveform
+                axes[i, 1].plot(x_hat[i].cpu().numpy())
+                axes[i, 1].set_title(f"Reconstructed Audio {i+1}")
+                axes[i, 1].set_ylim(-1.1, 1.1)
+            
+            plt.tight_layout()
+            self.logger.experiment.add_figure("Waveform Comparison", fig, self.global_step)
+            plt.close(fig)
+            
+            # Create simple spectrograms using PyTorch FFT
+            fig, axes = plt.subplots(num_samples, 2, figsize=(12, 4 * num_samples))
+            
+            # Handle case where num_samples = 1
+            if num_samples == 1:
+                axes = np.array([axes])
+            
+            for i in range(num_samples):
+                # Original spectrogram using FFT
+                # Apply window function
+                window = torch.hann_window(512).to(x.device)
+                # Use PyTorch's stft
+                X = torch.stft(
+                    x[i], 
+                    n_fft=512, 
+                    hop_length=128, 
+                    win_length=512, 
+                    window=window, 
+                    return_complex=True
+                )
+                X_db = 20 * torch.log10(torch.abs(X) + 1e-10)
+                axes[i, 0].imshow(X_db.cpu().numpy(), aspect='auto', origin='lower')
+                axes[i, 0].set_title(f"Original Spectrogram {i+1}")
+                
+                # Reconstructed spectrogram
+                X_hat = torch.stft(
+                    x_hat[i], 
+                    n_fft=512, 
+                    hop_length=128, 
+                    win_length=512, 
+                    window=window, 
+                    return_complex=True
+                )
+                X_hat_db = 20 * torch.log10(torch.abs(X_hat) + 1e-10)
+                axes[i, 1].imshow(X_hat_db.cpu().numpy(), aspect='auto', origin='lower')
+                axes[i, 1].set_title(f"Reconstructed Spectrogram {i+1}")
+            
+            plt.tight_layout()
+            self.logger.experiment.add_figure("Spectrogram Comparison", fig, self.global_step)
+            plt.close(fig)
+            
+            # Log WST coefficients visualization
+            with torch.no_grad():
+                # Original audio WST
+                x_wst = self.wst(x[:num_samples].unsqueeze(1))
+                
+                # Reconstructed audio WST
+                x_hat_wst = self.wst(x_hat[:num_samples].unsqueeze(1))
+                
+                # Create figure for WST coefficient comparison
+                fig, axes = plt.subplots(num_samples, 2, figsize=(12, 4 * num_samples))
+                
+                # Handle case where num_samples = 1
+                if num_samples == 1:
+                    axes = np.array([axes])
+                
+                for i in range(num_samples):
+                    # Original WST coefficients (mean across channels for visualization)
+                    wst_orig = x_wst[i].abs().mean(dim=0).cpu().numpy()
+                    im = axes[i, 0].imshow(wst_orig.reshape(-1, 1), aspect='auto', origin='lower')
+                    axes[i, 0].set_title(f"Orig WST Mean {i+1}")
+                    
+                    # Reconstructed WST coefficients
+                    wst_recon = x_hat_wst[i].abs().mean(dim=0).cpu().numpy()
+                    im = axes[i, 1].imshow(wst_recon.reshape(-1, 1), aspect='auto', origin='lower')
+                    axes[i, 1].set_title(f"Recon WST Mean {i+1}")
+                
+                plt.tight_layout()
+                self.logger.experiment.add_figure("WST Coefficient Comparison", fig, self.global_step)
+                plt.close(fig)
+            
+            # Log raw audio
+            for i in range(num_samples):
+                self.logger.experiment.add_audio(
+                    f"Original Audio {i+1}",
+                    x[i].unsqueeze(0).cpu(),
+                    self.global_step,
+                    sample_rate=self.sample_rate
+                )
+                self.logger.experiment.add_audio(
+                    f"Reconstructed Audio {i+1}",
+                    x_hat[i].unsqueeze(0).cpu(),
+                    self.global_step,
+                    sample_rate=self.sample_rate
+                )
+        
         return loss
     
     def configure_optimizers(self):
