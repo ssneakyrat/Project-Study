@@ -10,7 +10,7 @@ from models.complex_layers import ComplexConv1d, ComplexBatchNorm1d, ComplexLeak
 class ComplexEncoder(nn.Module):
     def __init__(self, input_channels, channels, kernel_sizes, strides, paddings=None, dropout=0.1, use_batch_norm=True):
         """
-        Complex-valued encoder network
+        Complex-valued encoder network with dimension consistency checks
         
         Args:
             input_channels (int): Number of input channels
@@ -81,16 +81,27 @@ class ComplexEncoder(nn.Module):
     
     def forward(self, x):
         """
-        Forward pass through encoder with optional gradient checkpointing
+        Forward pass through encoder with consistent dimension handling
         
         Args:
-            x (tuple): Tuple of (real, imaginary) tensors
+            x (tuple): Tuple of (real, imaginary) tensors with shape [B, C, T]
             
         Returns:
             tuple: Tuple of (encoded features, intermediate outputs)
                   encoded features: (real, imaginary) tensors
                   intermediates: list of (real, imaginary) tensors
         """
+        # Initial dimension check - EXPECT [B, C, T] FORMAT
+        if isinstance(x, tuple):
+            real, imag = x
+            
+            # Check if dimensions need to be transposed (if in [B, T, C] format)
+            if real.dim() == 3 and real.size(2) == self.input_channels and real.size(1) != self.input_channels:
+                print(f"WARNING: Encoder input has incorrect format [B, T, C]: {real.shape}, transposing...")
+                real = real.transpose(1, 2)
+                imag = imag.transpose(1, 2)
+                x = (real, imag)
+        
         intermediates = []
         
         # Pass through layers and store intermediates for skip connections
@@ -108,7 +119,21 @@ class ComplexEncoder(nn.Module):
                     use_reentrant=False
                 )
             else:
-                x = layer(x)
+                # Before passing to the layer, ensure complex tuple has correct format
+                if isinstance(x, tuple):
+                    real, imag = x
+                    
+                    # Check channel dimension
+                    if i > 0:  # Skip first layer as it was already checked
+                        expected_channels = self.layers[i][0].in_channels
+                        if real.size(1) != expected_channels:
+                            print(f"WARNING: Layer {i} input has {real.size(1)} channels, expected {expected_channels}")
+                    
+                    # Pass through layer
+                    x = layer(x)
+                else:
+                    # If not a tuple (shouldn't happen but handle anyway)
+                    x = layer(x)
                 
             intermediates.append(x)
         

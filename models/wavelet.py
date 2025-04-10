@@ -11,7 +11,7 @@ from kymatio.torch import Scattering1D
 class WaveletScatteringTransform(nn.Module):
     def __init__(self, J, Q, T, sample_rate, normalize=True, max_order=1, ensure_output_dim=True):
         """
-        Wavelet Scattering Transform module with improved dimension handling
+        Wavelet Scattering Transform module with standardized dimension handling
         
         Args:
             J (int): Number of scales
@@ -44,15 +44,26 @@ class WaveletScatteringTransform(nn.Module):
         # Use optimal padding computation based on J
         self.optimal_pad = 2**J
         
+        # Calculate expected number of channels (frequency bands)
+        if max_order == 1:
+            # For first-order: lowpass + bandpass filters
+            self.expected_channels = 1 + J * Q
+        else:
+            # For second-order: approximate formula
+            self.expected_channels = 1 + J * Q + (J * Q)**2 // 4
+        
+        print(f"WST will output {self.expected_channels} channels with temporal dim {self.expected_output_time_dim}")
+        
     def forward(self, x):
         """
-        Apply wavelet scattering transform to input audio with simplified dimension handling
+        Apply wavelet scattering transform to input audio with consistent dimension handling
         
         Args:
             x (Tensor): Input audio of shape [batch_size, time] or [batch_size, 1, time]
                 
         Returns:
             Tuple of (real, imaginary) tensors representing complex scattering coefficients
+            Both with shape [batch_size, channels, time]
         """
         # Store original batch size
         batch_size = x.size(0)
@@ -100,33 +111,34 @@ class WaveletScatteringTransform(nn.Module):
             'was_padded': original_signal_padded
         }
         
-        print(f"WST input after padding: {x.shape}")
-        
         # Apply scattering transform
         x = x.contiguous()  # Ensure tensor is memory-contiguous
         Sx = self.scattering(x)
         
         print(f"Raw scattering output shape: {Sx.shape}")
         
-        # SIMPLIFIED APPROACH: Handle different output formats more robustly
-        # Reshape to [batch, channels, time] without complex reshaping logic
-        
+        # Standardize format to [batch_size, channels, time]
         if Sx.dim() == 4:
             # Format is [batch, order, coeff, time]
-            
-            # SIMPLE FIX: Just flatten the middle two dimensions
-            # This avoids complex channel extraction logic that might break
+            # Reshape to [batch, order*coeff, time]
             B, O, C, T = Sx.shape
             Sx = Sx.reshape(B, O*C, T)
             print(f"Reshaped scattering output: {Sx.shape}")
-            
-            # Real part is the reshaped Sx, imaginary is zeros with same shape
-            real_part = Sx
-            imag_part = torch.zeros_like(real_part)
-        else:
-            # Standard format
-            real_part = Sx
-            imag_part = torch.zeros_like(real_part)
+        elif Sx.dim() == 3:
+            # Check if format is [batch, time, channels] and transpose if needed
+            if Sx.size(1) == self.expected_output_time_dim and Sx.size(2) != self.expected_output_time_dim:
+                Sx = Sx.transpose(1, 2)
+                print(f"Transposed scattering output to [B,C,T]: {Sx.shape}")
+        
+        # NOW CRITICALLY IMPORTANT: Ensure output is always [B, C, T]
+        # If we detect it's in [B, T, C] format, transpose it
+        if Sx.size(2) == self.expected_channels and Sx.size(1) != self.expected_channels:
+            print(f"Detected output in [B,T,C] format, transposing to [B,C,T]")
+            Sx = Sx.transpose(1, 2)
+        
+        # Real part is the reshaped Sx, imaginary is zeros with same shape
+        real_part = Sx
+        imag_part = torch.zeros_like(real_part)
         
         # Normalize if requested
         if self.normalize:
@@ -140,6 +152,9 @@ class WaveletScatteringTransform(nn.Module):
         
         # Print final dimensions for debugging
         print(f"Final WST output - Real: {real_part.shape}, Imag: {imag_part.shape}")
+        
+        # Verify shape is correct before returning
+        assert real_part.size(1) != self.expected_output_time_dim, "WST output has incorrect dimension format!"
         
         return (real_part, imag_part)
 

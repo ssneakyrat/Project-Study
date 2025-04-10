@@ -114,7 +114,7 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
     
     def forward(self, x):
         """
-        Forward pass through the model with robust dimension handling
+        Forward pass through the model with consistent dimension handling
         
         Args:
             x (Tensor): Input audio [B, T]
@@ -142,18 +142,25 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
                 # Trim to target length
                 x = x[..., :target_length]
         
-        # Apply wavelet scattering transform
+        # Apply wavelet scattering transform - SHOULD RETURN [B, C, T] FORMAT
         wst_output = self.wst(x)
         
         # Print output shape for debugging
         if isinstance(wst_output, tuple):
             real, imag = wst_output
-            print(f"WST output before adaptation: Real {real.shape}, Imag {imag.shape}")
+            print(f"WST output dimensions: Real {real.shape}, Imag {imag.shape}")
             
+            # ENSURE WST OUTPUT IS IN [B, C, T] FORMAT
             # Get expected input channels for first encoder layer
             expected_channels = self.encoder.layers[0][0].in_channels
             
-            # Adapt WST output to encoder's expected channels with a proper channel projection
+            # 1. Check if dimensions are swapped [B, T, C] and fix if needed
+            if real.size(2) == expected_channels and real.size(1) != expected_channels:
+                print(f"Transposing WST output from [B, T, C] to [B, C, T]")
+                real = real.transpose(1, 2)
+                imag = imag.transpose(1, 2)
+            
+            # 2. Adapt channels if needed using a channel projection
             if real.size(1) != expected_channels:
                 print(f"Creating channel projection from {real.size(1)} to {expected_channels}")
                 
@@ -170,20 +177,15 @@ class ComplexAudioEncoderDecoder(pl.LightningModule):
                 real = channel_proj(real)
                 imag = channel_proj(imag)
                 
-                print(f"WST output after adaptation: Real {real.shape}, Imag {imag.shape}")
-                wst_output = (real, imag)
+                print(f"WST output after adaptation: Real {real.shape}, Imag {real.shape}")
             
-            # If dimensions need to be transposed
-            if real.size(1) > real.size(2) * 2:  # Simple heuristic to detect wrong order
-                print("Transposing WST output dimensions...")
-                real = real.transpose(1, 2)
-                imag = imag.transpose(1, 2)
-                wst_output = (real, imag)
+            # Update wst_output with properly shaped tensors
+            wst_output = (real, imag)
         
-        # Pass through encoder
+        # Pass through encoder - EXPECTS [B, C, T] FORMAT
         encoded, intermediates = self.encoder(wst_output)
         
-        # Pass through decoder with skip connections
+        # Pass through decoder with skip connections - SHOULD MAINTAIN [B, C, T] FORMAT
         decoded = self.decoder(encoded, intermediates)
         
         # Convert complex output to real

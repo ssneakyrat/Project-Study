@@ -38,6 +38,16 @@ class ComplexConv1d(nn.Module):
         self.dilation = dilation
         
     def forward(self, x):
+        """
+        Forward pass with consistent dimension handling
+        
+        Args:
+            x: Either a ComplexTensor, tuple of (real, imag) tensors, or real tensor
+               Expected shape: [B, C, T] for each tensor component
+               
+        Returns:
+            tuple: (real, imag) output tensors with shape [B, C_out, T_out]
+        """
         if isinstance(x, ComplexTensor):
             x_real, x_imag = x.real, x.imag
         elif isinstance(x, tuple):
@@ -46,9 +56,17 @@ class ComplexConv1d(nn.Module):
             x_real, x_imag = x, torch.zeros_like(x)
         
         # First handle extra dimensions
-        if x_real.dim() == 4:
+        if x_real.dim() > 3:
+            print(f"WARNING: Input has too many dimensions: {x_real.shape}, squeezing...")
             x_real = x_real.squeeze(2)
             x_imag = x_imag.squeeze(2)
+        
+        # CRITICAL DIMENSION HANDLING - Ensure [B, C, T] format
+        # Check if channels and time are swapped and fix if needed
+        if x_real.dim() == 3 and x_real.size(2) == self.in_channels and x_real.size(1) != self.in_channels:
+            print(f"WARNING: Input has swapped dimensions [B, T, C]: {x_real.shape}, transposing...")
+            x_real = x_real.transpose(1, 2)
+            x_imag = x_imag.transpose(1, 2)
         
         # Check and fix channel dimensions if needed
         if x_real.size(1) != self.in_channels:
@@ -65,13 +83,6 @@ class ComplexConv1d(nn.Module):
             x_real = adapted_real
             x_imag = adapted_imag
         
-        # Check and transpose dimensions if needed
-        if x_real.size(1) > x_real.size(-1) or x_real.dim() > 3:
-            print(f"Warning: Unusual tensor shape for Conv1d: {x_real.shape}, correcting...")
-            if x_real.dim() == 3:
-                x_real = x_real.transpose(1, 2)
-                x_imag = x_imag.transpose(1, 2)
-
         # Regular convolution operations
         real = self.conv_re(x_real) - self.conv_im(x_imag)
         imag = self.conv_re(x_imag) + self.conv_im(x_real)       
@@ -111,13 +122,14 @@ class ComplexConvTranspose1d(nn.Module):
 
     def forward(self, x):
         """
-        Forward pass
+        Forward pass with consistent dimension handling
         
         Args:
-            x (tuple): Tuple of (real, imag) tensors
-            
+            x: Either a ComplexTensor, tuple of (real, imag) tensors, or real tensor
+               Expected shape: [B, C, T] for each tensor component
+               
         Returns:
-            tuple: Tuple of (real, imag) tensors
+            tuple: (real, imag) output tensors with shape [B, C_out, T_out]
         """
         if isinstance(x, ComplexTensor):
             x_real, x_imag = x.real, x.imag
@@ -125,6 +137,28 @@ class ComplexConvTranspose1d(nn.Module):
             x_real, x_imag = x
         else:  # Handle the case where input is real
             x_real, x_imag = x, torch.zeros_like(x)
+        
+        # CRITICAL DIMENSION HANDLING - Ensure [B, C, T] format
+        # Check if channels and time are swapped and fix if needed
+        if x_real.dim() == 3 and x_real.size(2) == self.in_channels and x_real.size(1) != self.in_channels:
+            print(f"WARNING: Input has swapped dimensions [B, T, C]: {x_real.shape}, transposing...")
+            x_real = x_real.transpose(1, 2)
+            x_imag = x_imag.transpose(1, 2)
+            
+        # Check and fix channel dimensions if needed
+        if x_real.size(1) != self.in_channels:
+            print(f"Adjusting channel dimensions from {x_real.size(1)} to {self.in_channels}")
+            # Create adapted tensors
+            adapted_real = torch.zeros(x_real.size(0), self.in_channels, x_real.size(2), device=x_real.device)
+            adapted_imag = torch.zeros(x_imag.size(0), self.in_channels, x_imag.size(2), device=x_imag.device)
+            
+            # Copy as many channels as we can
+            copy_channels = min(x_real.size(1), self.in_channels)
+            adapted_real[:, :copy_channels] = x_real[:, :copy_channels]
+            adapted_imag[:, :copy_channels] = x_imag[:, :copy_channels]
+            
+            x_real = adapted_real
+            x_imag = adapted_imag
         
         # Real component: (W_re * x_re - W_im * x_im)
         real = self.deconv_re(x_real) - self.deconv_im(x_imag)
