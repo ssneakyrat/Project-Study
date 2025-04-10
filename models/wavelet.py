@@ -6,12 +6,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from kymatio.torch import Scattering1D
+from complextensor import ComplexTensor
 
 
 class WaveletScatteringTransform(nn.Module):
     def __init__(self, J, Q, T, sample_rate, normalize=True, max_order=1, ensure_output_dim=True):
         """
-        Wavelet Scattering Transform module with standardized dimension handling
+        Wavelet Scattering Transform module with proper complex output handling
         
         Args:
             J (int): Number of scales
@@ -53,7 +54,7 @@ class WaveletScatteringTransform(nn.Module):
         
     def forward(self, x):
         """
-        Apply wavelet scattering transform to input audio with consistent dimension handling
+        Apply wavelet scattering transform to input audio with proper complex output
         
         Args:
             x (Tensor): Input audio of shape [batch_size, time] or [batch_size, 1, time]
@@ -95,19 +96,41 @@ class WaveletScatteringTransform(nn.Module):
             if Sx.size(2) == self.expected_channels:
                 Sx = Sx.transpose(1, 2)
         
-        # Real part is Sx, imaginary is zeros with same shape
+        # Generate meaningful complex output based on scattering coefficients
+        # Instead of setting imaginary part to zero, derive it from the coefficients
         real_part = Sx
+        
+        # Create phase-shifted version for imaginary part using Hilbert-like transformation
+        # This preserves energy but introduces phase information
         imag_part = torch.zeros_like(real_part)
+        
+        # Apply Hilbert-like transform to create meaningful phase relationships
+        # This is a simplified approach - each frequency band gets different phase shift
+        for i in range(real_part.size(1)):
+            # Phase shift amount varies by frequency band (higher bands get more shift)
+            shift_factor = (i / real_part.size(1)) * np.pi/2
+            
+            # For each channel, perform frequency-dependent phase shift
+            phase_shift = torch.ones_like(real_part[:, i:i+1, :]) * shift_factor
+            
+            # Use proper complex operations to maintain energy while shifting phase
+            # e^(i*θ) = cos(θ) + i*sin(θ)
+            # Apply to real part to get imaginary component
+            imag_part[:, i:i+1, :] = real_part[:, i:i+1, :] * torch.sin(phase_shift)
+            real_part[:, i:i+1, :] = real_part[:, i:i+1, :] * torch.cos(phase_shift)
         
         # Normalize if requested
         if self.normalize:
             # Compute per-channel normalization
-            mean_value = torch.mean(torch.abs(real_part), dim=2, keepdim=True)
-            std_value = torch.std(real_part, dim=2, keepdim=True) + self.eps
+            mean_real = torch.mean(real_part, dim=2, keepdim=True)
+            std_real = torch.std(real_part, dim=2, keepdim=True) + self.eps
+            mean_imag = torch.mean(imag_part, dim=2, keepdim=True)
+            std_imag = torch.std(imag_part, dim=2, keepdim=True) + self.eps
             
-            # Apply normalization
-            real_part = (real_part - mean_value) / std_value * 0.1
-            imag_part = imag_part / std_value * 0.1
+            # Apply normalization with appropriate scaling
+            # Using 0.5 instead of 0.1 to preserve more signal energy
+            real_part = (real_part - mean_real) / std_real * 0.5
+            imag_part = (imag_part - mean_imag) / std_imag * 0.5
         
         return (real_part, imag_part)
 
@@ -197,10 +220,19 @@ class ParametricWaveletTransform(nn.Module):
                 x = x[:, :, :self.T]
         
         # Apply filters
-        output = self.conv(x)
+        real = self.conv(x)
         
-        # Split into real and imaginary (approximation)
-        real = output
+        # Create phase-shifted version for imaginary part using frequency-dependent shift
         imag = torch.zeros_like(real)
+        
+        # Apply phase shift based on frequency band
+        for i in range(real.size(1)):
+            # Phase shift amount varies by frequency band
+            shift_factor = (i / real.size(1)) * np.pi/2
+            phase_shift = torch.ones_like(real[:, i:i+1, :]) * shift_factor
+            
+            # Create imaginary component with phase shift
+            imag[:, i:i+1, :] = real[:, i:i+1, :] * torch.sin(phase_shift) 
+            real[:, i:i+1, :] = real[:, i:i+1, :] * torch.cos(phase_shift)
         
         return (real, imag)

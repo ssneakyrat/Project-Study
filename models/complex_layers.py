@@ -37,6 +37,10 @@ class ComplexConv1d(nn.Module):
         self.padding = padding
         self.dilation = dilation
         
+        # Initialize with orthogonal weights for better phase preservation
+        nn.init.orthogonal_(self.conv_re.weight)
+        nn.init.orthogonal_(self.conv_im.weight)
+        
     def forward(self, x):
         """
         Forward pass
@@ -91,6 +95,10 @@ class ComplexConvTranspose1d(nn.Module):
         self.padding = padding
         self.output_padding = output_padding
         self.dilation = dilation
+        
+        # Initialize with orthogonal weights for better phase preservation
+        nn.init.orthogonal_(self.deconv_re.weight)
+        nn.init.orthogonal_(self.deconv_im.weight)
 
     def forward(self, x):
         """
@@ -202,7 +210,7 @@ class ComplexTanh(nn.Module):
         
     def forward(self, x):
         """
-        Forward pass
+        Forward pass with better phase preservation
         
         Args:
             x (tuple): Tuple of (real, imag) tensors with shape [B, C, T] each
@@ -217,9 +225,18 @@ class ComplexTanh(nn.Module):
         else:
             x_real, x_imag = x, torch.zeros_like(x)
         
-        # Simple approximation - applying tanh separately to real and imaginary parts
-        real = torch.tanh(x_real)
-        imag = torch.tanh(x_imag)
+        # Calculate magnitude
+        mag = torch.sqrt(x_real**2 + x_imag**2 + 1e-7)
+        
+        # Calculate phase
+        phase = torch.atan2(x_imag, x_real)
+        
+        # Apply tanh to magnitude while preserving phase
+        new_mag = torch.tanh(mag)
+        
+        # Convert back to real/imaginary
+        real = new_mag * torch.cos(phase)
+        imag = new_mag * torch.sin(phase)
         
         return (real, imag)
 
@@ -292,7 +309,7 @@ class ComplexToReal(nn.Module):
             return x  # Already real
         
         if self.mode == 'magnitude':
-            out = torch.sqrt(x_real**2 + x_imag**2)
+            out = torch.sqrt(x_real**2 + x_imag**2 + 1e-8)
         elif self.mode == 'real':
             out = x_real
         elif self.mode == 'imag':
@@ -301,23 +318,16 @@ class ComplexToReal(nn.Module):
             out = torch.atan2(x_imag, x_real)
         elif self.mode == 'mag_phase':
             # Enhanced magnitude and phase combination for better reconstruction
-            # This preserves both amplitude and phase information
-            mag = torch.sqrt(x_real**2 + x_imag**2)
+            mag = torch.sqrt(x_real**2 + x_imag**2 + 1e-8)
             phase = torch.atan2(x_imag, x_real)
             
             # Apply a smooth non-linearity to magnitude for better dynamic range
-            mag = torch.tanh(mag) * (1 + mag)
+            # Using a gentler compression curve to preserve more detail
+            mag = 2.0 * torch.tanh(mag / 2.0)
             
             # Reconstruct signal using magnitude and phase
-            # This maintains temporal coherence better than simple magnitude
+            # This maintains both amplitude and phase information
             out = mag * torch.cos(phase)
-        
-        # Ensure non-zero amplitudes to prevent artifacts
-        zero_mask = (torch.abs(out) < 1e-7)
-        if zero_mask.any():
-            # Add small amount of noise to prevent dead regions
-            noise = torch.randn_like(out) * 1e-6
-            out = torch.where(zero_mask, noise, out)
         
         # Check for NaN or inf values
         has_nan = torch.isnan(out).any().item()
