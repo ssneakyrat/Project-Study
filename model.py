@@ -38,6 +38,8 @@ class WSTVocoder(pl.LightningModule):
         
         self.sample_rate = sample_rate
         self.learning_rate = learning_rate
+        self.channels = channels
+        self.latent_dim = latent_dim
         
         # WST layer
         self.wst = WaveletScatteringTransform(
@@ -154,12 +156,30 @@ class WSTVocoder(pl.LightningModule):
         # Decoder with skip connections
         x_complex = z
         
+        # Create projection layers for skip connections if needed (lazily)
+        if not hasattr(self, 'skip_projections'):
+            self.skip_projections = nn.ModuleList([
+                ComplexConv1d(ch_in, ch_out, kernel_size=1) 
+                for ch_in, ch_out in zip(reversed(self.channels), [self.latent_dim] + self.channels[:-1])
+            ])
+        
         for i, layer in enumerate(self.decoder_layers):
             x_complex = layer(x_complex)
             
             # Add skip connection from encoder (except for the last decoder layer)
             if i < len(self.decoder_layers) - 1:
-                x_complex = x_complex + skip_connections[-(i+1)]
+                skip = skip_connections[-(i+1)]
+                
+                # Project channels to match decoder output if needed
+                skip = self.skip_projections[i](skip)
+                
+                # Resize time dimension if needed using interpolation
+                if skip.shape[2] != x_complex.shape[2]:
+                    skip_real = F.interpolate(skip.real, size=x_complex.shape[2], mode='linear', align_corners=False)
+                    skip_imag = F.interpolate(skip.imag, size=x_complex.shape[2], mode='linear', align_corners=False)
+                    skip = torch.complex(skip_real, skip_imag)
+                
+                x_complex = x_complex + skip
         
         # Output layer
         x_complex = self.output_layer(x_complex)
