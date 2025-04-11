@@ -16,7 +16,7 @@ wavelet: 'db4'
 dwt_level: 3
 
 # Model architecture
-autoencoder_type: 'standard'  # Options: 'standard', 'convolutional', 'conv'
+autoencoder_type: 'conv'  # Options: 'standard', 'convolutional', 'conv'
 hidden_dims: [128, 64, 32]    # Used by standard autoencoder
 latent_dim: 16
 base_channels: 32             # Used by convolutional autoencoder
