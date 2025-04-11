@@ -281,21 +281,17 @@ class WaveletDecoder(pl.LightningModule):
         z: [B, 256] bottleneck representation
         Returns: [B, 1, 16000] reconstructed audio
         """
-        # Upsampling: [B,256] → Reshape/Linear → [B,256,125]
+        # Upsampling: [B,256] → [B,256,2000]
         x = self.upsampling(z)
         
-        # [B,256,125] → Transpose-Conv1D → [B,128,500]
+        # Channel reduction: [B,256,2000] → [B,32,2000]
+        x = self.channel_reduction(x)
+        
+        # First upconv: [B,32,2000] → [B,32,4000]
         x = F.relu(self.upconv1(x))
         
-        # Reconstruction: 3×Transpose-Conv1D as specified in architecture
-        # [B,128,500] → [B,64,1000]
+        # Second upconv: [B,32,4000] → [B,wavelet_channels,8000]
         x = F.relu(self.upconv2(x))
-        
-        # [B,64,1000] → [B,32,2000]
-        x = F.relu(self.upconv3(x))
-        
-        # [B,32,2000] → [B,wavelet_channels,8000] with a single stride 4 convolution
-        x = F.relu(self.upconv4(x))
         
         # Inverse wavelet transform: [B,wavelet_channels,8000] → [B,1,16000]
         x = self.inverse_wavelet(x)
