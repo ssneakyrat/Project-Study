@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 # Import model components
 from models.dwt import DWT, IDWT
-from models.wem import WaveletEchoMatrix, HierarchicalEncoder, HierarchicalDecoder
+from models.wem import WaveletEchoMatrix, UnifiedEncoder, UnifiedDecoder, ResidualBlock
 from models.loss import WaveletMSELoss, TimeDomainMSELoss, CombinedLoss
 from models.metric import SignalToNoiseRatio, SpectralConvergence, LogSpectralDistance, MultiMetric
 
@@ -149,8 +149,8 @@ class ModelTester:
         }
     
     def test_encoder(self, coeffs=None):
-        """Test the Hierarchical Encoder"""
-        print("\n===== Testing Hierarchical Encoder =====")
+        """Test the Unified Encoder"""
+        print("\n===== Testing Unified Encoder =====")
         
         if coeffs is None:
             # Get coefficients from DWT
@@ -160,11 +160,11 @@ class ModelTester:
             coeffs = dwt.threshold_coeffs(coeffs)
         
         # Initialize encoder
-        encoder = HierarchicalEncoder(levels=self.levels, hidden_dim=self.hidden_dim).to(self.device)
+        encoder = UnifiedEncoder(levels=self.levels, hidden_dim=self.hidden_dim).to(self.device)
         
         # Forward pass
         print("Encoding coefficients to latent space...")
-        z = encoder(coeffs)
+        z, encoded_features = encoder(coeffs)
         
         # Check latent shape
         print(f"Latent space shape: {z.shape}")
@@ -198,21 +198,31 @@ class ModelTester:
             print(f"❌ {dead_neurons} dead neurons detected ({dead_percentage:.2f}% of latent space)")
         else:
             print("✅ No dead neurons detected in latent space.")
+            
+        # Check encoded features for skip connections
+        print(f"\nVerifying encoded features for skip connections:")
+        for i, feat in enumerate(encoded_features):
+            print(f"  Feature {i} shape: {feat.shape}")
+            if torch.isnan(feat).any().item():
+                print(f"  ❌ NaNs detected in feature {i}")
+            else:
+                print(f"  ✅ Feature {i} is valid (no NaNs)")
         
         return {
-            "latent": z
+            "latent": z,
+            "encoded_features": encoded_features
         }
     
-    def test_decoder(self, coeffs=None, latent=None):
-        """Test the Hierarchical Decoder"""
-        print("\n===== Testing Hierarchical Decoder =====")
+    def test_decoder(self, coeffs=None, latent=None, encoded_features=None):
+        """Test the Unified Decoder"""
+        print("\n===== Testing Unified Decoder =====")
         
-        if coeffs is None or latent is None:
+        if coeffs is None or latent is None or encoded_features is None:
             # Get coefficients and latent from previous steps
             dwt = DWT(wave=self.wavelet, level=self.levels).to(self.device)
             coeffs = dwt(self.test_data)
-            encoder = HierarchicalEncoder(levels=self.levels, hidden_dim=self.hidden_dim).to(self.device)
-            latent = encoder(coeffs)
+            encoder = UnifiedEncoder(levels=self.levels, hidden_dim=self.hidden_dim).to(self.device)
+            latent, encoded_features = encoder(coeffs)
         
         # Original shapes for reconstruction
         orig_shapes = {
@@ -221,7 +231,7 @@ class ModelTester:
         }
         
         # Initialize decoder
-        decoder = HierarchicalDecoder(
+        decoder = UnifiedDecoder(
             levels=self.levels, 
             hidden_dim=self.hidden_dim, 
             latent_dim=latent.shape[1]
@@ -229,7 +239,7 @@ class ModelTester:
         
         # Forward pass
         print("Decoding latent space to coefficients...")
-        rec_coeffs = decoder(latent, orig_shapes)
+        rec_coeffs = decoder(latent, encoded_features, orig_shapes)
         
         # Check coefficient shapes
         print(f"Original approximation shape: {coeffs['a'].shape}")
@@ -274,6 +284,55 @@ class ModelTester:
             "a_mse": a_mse,
             "d_mse": d_mse
         }
+    
+    def test_residual_block(self):
+        """Test ResidualBlock functionality"""
+        print("\n===== Testing ResidualBlock Component =====")
+        
+        # Create a test input
+        batch_size = self.test_data.shape[0]
+        channels = 16
+        seq_len = 100
+        test_input = torch.randn(batch_size, channels, seq_len).to(self.device)
+        
+        # Create residual block
+        res_block = ResidualBlock(channels).to(self.device)
+        
+        # Forward pass
+        output = res_block(test_input)
+        
+        # Check output shape
+        if output.shape == test_input.shape:
+            print("✅ ResidualBlock preserves input shape correctly")
+        else:
+            print(f"❌ ResidualBlock shape mismatch: {output.shape} != {test_input.shape}")
+        
+        # Check for NaNs
+        if torch.isnan(output).any().item():
+            print("❌ WARNING: NaN values detected in ResidualBlock output!")
+        else:
+            print("✅ ResidualBlock output is valid (no NaNs).")
+        
+        # Check if residual connections are working (output should not be identical to input)
+        diff = torch.mean(torch.abs(output - test_input)).item()
+        if diff < 1e-6:
+            print("❌ WARNING: Output is nearly identical to input, residual connection may not be working!")
+        else:
+            print(f"✅ ResidualBlock is modifying the input (mean abs diff: {diff:.6f})")
+        
+        # Test gradient flow through residual block
+        test_input.requires_grad_(True)
+        output = res_block(test_input)
+        loss = output.mean()
+        loss.backward()
+        
+        if test_input.grad is None or torch.all(test_input.grad == 0):
+            print("❌ WARNING: No gradient flowing through ResidualBlock!")
+        else:
+            mean_grad = torch.mean(torch.abs(test_input.grad)).item()
+            print(f"✅ Gradient is flowing through ResidualBlock (mean abs grad: {mean_grad:.6f})")
+        
+        return {"output": output, "input": test_input}
     
     def test_full_model(self):
         """Test the full WaveletEchoMatrix model"""
@@ -380,7 +439,7 @@ class ModelTester:
         ).to(self.device)
         
         # Initialize optimizer
-        optimizer = torch.optim.Adam(
+        optimizer = torch.optim.AdamW(  # Changed from Adam to AdamW
             model.parameters(),
             lr=self.config["training"]["learning_rate"],
             weight_decay=self.config["training"]["weight_decay"]
@@ -483,10 +542,17 @@ class ModelTester:
         """Analyze potential issues with the model learning"""
         print("\n===== Model Learning Analysis =====")
         
-        # Run all tests first
+        # First test the residual block specifically
+        self.test_residual_block()
+        
+        # Run all tests
         dwt_results = self.test_dwt_idwt()
         encoder_results = self.test_encoder(dwt_results["thresh_coeffs"])
-        decoder_results = self.test_decoder(dwt_results["thresh_coeffs"], encoder_results["latent"])
+        decoder_results = self.test_decoder(
+            dwt_results["thresh_coeffs"], 
+            encoder_results["latent"],
+            encoder_results["encoded_features"]
+        )
         full_model_results = self.test_full_model()
         gradient_results = self.test_gradient_flow()
         
@@ -514,7 +580,7 @@ class ModelTester:
         # Issue 4: Decoder coefficient reconstruction
         avg_d_mse = sum(decoder_results["d_mse"]) / len(decoder_results["d_mse"])
         if avg_d_mse > 0.1:
-            print("⚠️ Hierarchical decoder has high error in coefficient reconstruction.")
+            print("⚠️ Unified decoder has high error in coefficient reconstruction.")
         
         # Issue 5: Gradient flow
         if gradient_results["unchanged_percentage"] > 20:
@@ -541,6 +607,9 @@ class ModelTester:
         if full_model_results["psnr"] < 10:
             major_issues.append("Very poor reconstruction quality")
         
+        if has_vanishing_grads := gradient_results.get("has_vanishing_grads", False):
+            major_issues.append("Vanishing gradients")
+        
         if len(major_issues) > 0:
             print("❌ Major issues detected:")
             for issue in major_issues:
@@ -556,30 +625,27 @@ class ModelTester:
         # Recommendations
         print("\n===== Recommendations =====")
         print("1. Model Architecture:")
-        print("   - Current parameter count: ~944,000 parameters")
+        #print(f"   - Current parameter count: ~{total_params:,} parameters")
         
         if gradient_results["unchanged_percentage"] > 30:
-            print("   - Consider simplifying model architecture to improve gradient flow")
-            print("   - Reduce depth of hierarchical encoder/decoder")
+            print("   - Consider adjusting residual connections for better gradient flow")
+            print("   - Add more BatchNorm layers or try LayerNorm instead")
         else:
-            print("   - Architecture complexity seems appropriate")
+            print("   - Architecture seems to be facilitating good gradient flow")
         
         print("\n2. Training Process:")
         print("   - Test with smaller batch sizes for more frequent updates")
         print("   - Consider learning rate schedule with warm-up")
-        print("   - Try different optimizer (e.g., AdamW, RAdam)")
         
         print("\n3. Wavelet Configuration:")
         print(f"   - Current wavelet: {self.wavelet}, Levels: {self.levels}")
         
         if dwt_results["psnr"] < 35:
             print("   - Try different wavelet types (e.g., 'haar', 'sym4', 'coif3')")
-            print("   - Experiment with fewer decomposition levels")
         
         print("\n4. Loss Function:")
         print(f"   - Current weights: Wavelet = {self.config['loss']['wavelet_loss_weight']}, Time = {self.config['loss']['time_loss_weight']}")
         print("   - Experiment with different loss function weights")
-        print("   - Add perceptual or frequency-domain losses")
         
         print("\nFinal Note: Remember the model is designed for compression efficiency (125:1 ratio),")
         print("which naturally limits reconstruction quality. Trade-offs are expected.")

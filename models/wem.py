@@ -3,179 +3,231 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.dwt import DWT, IDWT
 
-class HierarchicalEncoder(nn.Module):
-    def __init__(self, levels=6, hidden_dim=128):
-        super(HierarchicalEncoder, self).__init__()
+class ResidualBlock(nn.Module):
+    """
+    Residual block with BatchNorm and LeakyReLU activation
+    """
+    def __init__(self, channels, kernel_size=3):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=kernel_size//2)
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.lrelu1 = nn.LeakyReLU(0.2)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=kernel_size//2)
+        self.bn2 = nn.BatchNorm1d(channels)
+        self.lrelu2 = nn.LeakyReLU(0.2)
+        
+    def forward(self, x):
+        residual = x
+        out = self.lrelu1(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out + residual  # Skip connection
+        out = self.lrelu2(out)
+        return out
+
+class UnifiedEncoder(nn.Module):
+    """
+    Simplified unified encoder for wavelet coefficients with better gradient flow
+    """
+    def __init__(self, levels=4, hidden_dim=64):
+        super(UnifiedEncoder, self).__init__()
         self.levels = levels
         self.hidden_dim = hidden_dim
         
-        # Approximation branch encoder (for level 6 approximation coefficients)
-        self.approx_encoder = nn.Sequential(
-            nn.Conv1d(1, hidden_dim // 2, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv1d(hidden_dim // 2, hidden_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2)
-        )
-        
-        # Detail branch encoders for each level
-        self.detail_encoders = nn.ModuleList()
-        for i in range(levels):
-            if i < 4:  # Levels 1-4 use larger networks due to more coefficients
-                encoder = nn.Sequential(
-                    nn.Conv1d(1, hidden_dim // 2, kernel_size=3, padding=1),
-                    nn.LeakyReLU(0.2),
-                    nn.Conv1d(hidden_dim // 2, hidden_dim, kernel_size=3, padding=1),
-                    nn.LeakyReLU(0.2),
-                    nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+        # Initial convolutions for each coefficient level
+        self.initial_convs = nn.ModuleList()
+        for i in range(levels + 1):  # +1 for approximation coefficients
+            # Use smaller kernels for higher frequency details
+            kernel_size = 5 if i >= levels-1 else 7
+            self.initial_convs.append(
+                nn.Sequential(
+                    nn.Conv1d(1, hidden_dim, kernel_size=kernel_size, padding=kernel_size//2),
+                    nn.BatchNorm1d(hidden_dim),
                     nn.LeakyReLU(0.2)
                 )
-            else:  # Levels 5-6 use smaller networks
-                encoder = nn.Sequential(
-                    nn.Conv1d(1, hidden_dim // 2, kernel_size=3, padding=1),
-                    nn.LeakyReLU(0.2),
-                    nn.Conv1d(hidden_dim // 2, hidden_dim, kernel_size=3, padding=1),
+            )
+        
+        # Unified processing blocks with residual connections
+        self.encoder_blocks = nn.ModuleList()
+        for i in range(levels + 1):
+            self.encoder_blocks.append(
+                nn.Sequential(
+                    ResidualBlock(hidden_dim),
+                    ResidualBlock(hidden_dim)
+                )
+            )
+        
+        # Progressive downsampling with preserved information
+        self.downsample = nn.ModuleList()
+        for i in range(levels + 1):
+            # Different downsampling factors based on coefficient length
+            factor = min(2**(levels-i), 8)  # Limit maximum downsampling
+            self.downsample.append(
+                nn.Sequential(
+                    nn.Conv1d(hidden_dim, hidden_dim*2, kernel_size=factor+1, stride=factor, padding=1),
+                    nn.BatchNorm1d(hidden_dim*2),
                     nn.LeakyReLU(0.2)
                 )
-            self.detail_encoders.append(encoder)
-        
-        # Fusion layer (to combine all encoded branches)
-        fusion_input_size = hidden_dim * (levels + 1)  # +1 for approximation coeffs
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_input_size, 512),
+            )
+            
+        # Fusion layer for combining all encoded features
+        fusion_input_dim = hidden_dim*2 * (levels+1)
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(fusion_input_dim, 512),
+            nn.LayerNorm(512),
             nn.LeakyReLU(0.2),
             nn.Linear(512, 256),
+            nn.LayerNorm(256),
             nn.LeakyReLU(0.2)
         )
         
     def forward(self, coeffs):
         """
-        Forward pass of hierarchical encoder
+        Forward pass of unified encoder
         Args:
             coeffs: Dictionary of wavelet coefficients {'a': approx, 'd': [detail1, ..., detailN]}
         Returns:
             z: Latent representation
+            encoded_features: Intermediate encoded features for skip connections
         """
         batch_size = coeffs['a'].shape[0]
+        encoded_features = []
+        feature_vectors = []
         
         # Process approximation coefficients
         a = coeffs['a'].unsqueeze(1)  # [B, 1, T]
-        encoded_a = self.approx_encoder(a)
-        # Global pooling to get fixed-size feature vector
-        pooled_a = F.adaptive_avg_pool1d(encoded_a, 1).view(batch_size, -1)
+        a_enc = self.initial_convs[0](a)
+        a_enc = self.encoder_blocks[0](a_enc)
+        encoded_features.append(a_enc)
+        
+        # Downsample and extract feature vector
+        a_down = self.downsample[0](a_enc)
+        a_feat = F.adaptive_avg_pool1d(a_down, 1).view(batch_size, -1)
+        feature_vectors.append(a_feat)
         
         # Process detail coefficients for each level
-        pooled_ds = []
         for j, d in enumerate(coeffs['d']):
             d = d.unsqueeze(1)  # [B, 1, T]
-            encoded_d = self.detail_encoders[j](d)
-            # Global pooling
-            pooled_d = F.adaptive_avg_pool1d(encoded_d, 1).view(batch_size, -1)
-            pooled_ds.append(pooled_d)
+            d_enc = self.initial_convs[j+1](d)
+            d_enc = self.encoder_blocks[j+1](d_enc)
+            encoded_features.append(d_enc)
+            
+            # Downsample and extract feature vector
+            d_down = self.downsample[j+1](d_enc)
+            d_feat = F.adaptive_avg_pool1d(d_down, 1).view(batch_size, -1)
+            feature_vectors.append(d_feat)
         
-        # Concatenate all pooled features
-        concat_features = torch.cat([pooled_a] + pooled_ds, dim=1)
+        # Concatenate all features and apply fusion layer
+        concat_features = torch.cat(feature_vectors, dim=1)
+        z = self.fusion_layer(concat_features)
         
-        # Apply fusion layer to get final latent representation
-        z = self.fusion(concat_features)
-        
-        return z
+        return z, encoded_features
 
-class HierarchicalDecoder(nn.Module):
-    def __init__(self, levels=6, hidden_dim=128, latent_dim=256):
-        super(HierarchicalDecoder, self).__init__()
+class UnifiedDecoder(nn.Module):
+    """
+    Simplified unified decoder with better gradient flow and skip connections
+    """
+    def __init__(self, levels=4, hidden_dim=64, latent_dim=256):
+        super(UnifiedDecoder, self).__init__()
         self.levels = levels
         self.hidden_dim = hidden_dim
-        self.latent_dim = latent_dim
         
-        # Initial expansion from latent to hidden
-        self.initial_expansion = nn.Sequential(
+        # Initial projection from latent space
+        self.latent_projection = nn.Sequential(
             nn.Linear(latent_dim, 512),
+            nn.LayerNorm(512),
             nn.LeakyReLU(0.2)
         )
         
-        # Branch distribution layers - small linear projections to create branch-specific features
-        self.approx_features = nn.Linear(512, hidden_dim)
-        self.detail_features = nn.ModuleList([nn.Linear(512, hidden_dim) for _ in range(levels)])
-        
-        # Parameter-efficient decoder for approximation coefficients
-        self.approx_decoder = nn.Sequential(
-            nn.ConvTranspose1d(hidden_dim, hidden_dim // 2, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.ConvTranspose1d(hidden_dim // 2, hidden_dim // 4, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.ConvTranspose1d(hidden_dim // 4, 1, kernel_size=4, stride=2, padding=1)
-        )
-        
-        # Create efficient decoders for detail coefficients at each level
-        # Each decoder uses a different number of upsampling operations based on its target size
-        self.detail_decoders = nn.ModuleList()
-        for i in range(levels):
-            # Number of upsampling operations needed for this level
-            # More upsampling for higher frequency detail coefficients
-            num_upsample = min(5, levels - i + 2)  # Empirical formula
-            
-            layers = []
-            in_channels = hidden_dim
-            
-            for j in range(num_upsample):
-                out_channels = max(hidden_dim // (2 ** (j+1)), 8)  # Decrease channels as we upsample
-                layers.extend([
-                    nn.ConvTranspose1d(in_channels, out_channels, kernel_size=4, stride=2, padding=1),
+        # Branch-specific feature generators
+        self.branch_projections = nn.ModuleList()
+        for i in range(levels + 1):
+            self.branch_projections.append(
+                nn.Sequential(
+                    nn.Linear(512, hidden_dim * 4),
+                    nn.LayerNorm(hidden_dim * 4),
                     nn.LeakyReLU(0.2)
-                ])
-                in_channels = out_channels
-            
-            # Final layer to output 1 channel
-            layers.append(nn.Conv1d(in_channels, 1, kernel_size=3, padding=1))
-            
-            self.detail_decoders.append(nn.Sequential(*layers))
+                )
+            )
         
-    def forward(self, z, orig_shapes):
+        # Unified decoder blocks with residual connections
+        self.decoder_blocks = nn.ModuleList()
+        for i in range(levels + 1):
+            # Add extra input channels for skip connections
+            self.decoder_blocks.append(
+                nn.Sequential(
+                    nn.Conv1d(hidden_dim*2, hidden_dim, kernel_size=3, padding=1),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.LeakyReLU(0.2),
+                    ResidualBlock(hidden_dim),
+                    ResidualBlock(hidden_dim)
+                )
+            )
+        
+        # Final output layers
+        self.output_layers = nn.ModuleList()
+        for i in range(levels + 1):
+            self.output_layers.append(
+                nn.Conv1d(hidden_dim, 1, kernel_size=3, padding=1)
+            )
+    
+    def forward(self, z, encoded_features, orig_shapes):
         """
-        Forward pass of hierarchical decoder
+        Forward pass of unified decoder
         Args:
             z: Latent representation
+            encoded_features: Intermediate encoded features from encoder (for skip connections)
             orig_shapes: Original shapes of wavelet coefficients
         Returns:
             coeffs: Reconstructed wavelet coefficients
         """
         batch_size = z.shape[0]
         
-        # Initial expansion
-        h = self.initial_expansion(z)
+        # Project latent vector to higher dimension
+        h = self.latent_projection(z)
         
-        # Generate features for approximation coefficients
-        a_features = self.approx_features(h).view(batch_size, -1, 1)  # [B, hidden_dim, 1]
-        
-        # Decode approximation coefficients
+        # Reconstruct approximation coefficients
         a_shape = orig_shapes['a']
-        a_rec = self.approx_decoder(a_features)
-        a_rec = F.interpolate(a_rec, size=a_shape[1])
-        a_rec = a_rec.squeeze(1)  # [B, T]
+        a_feat = self.branch_projections[0](h).view(batch_size, self.hidden_dim, 4)
         
-        # Reconstruct detail coefficients for each level
-        d_rec = []
+        # Upsample to match encoder feature size then concatenate with encoder features
+        a_up = F.interpolate(a_feat, size=encoded_features[0].size(2))
+        a_concat = torch.cat([a_up, encoded_features[0]], dim=1)
+        
+        # Apply decoder blocks
+        a_dec = self.decoder_blocks[0](a_concat)
+        
+        # Final layer and reshape to match original shape
+        a_out = self.output_layers[0](a_dec)
+        a_out = F.interpolate(a_out, size=a_shape[1])
+        a_out = a_out.squeeze(1)
+        
+        # Reconstruct detail coefficients
+        d_outs = []
         for j in range(self.levels):
-            # Get level-specific features
-            d_features = self.detail_features[j](h).view(batch_size, -1, 1)  # [B, hidden_dim, 1]
-            
-            # Apply decoder
             d_shape = orig_shapes['d'][j]
-            d = self.detail_decoders[j](d_features)
-            d = F.interpolate(d, size=d_shape[1])
-            d = d.squeeze(1)  # [B, T]
-            d_rec.append(d)
+            d_feat = self.branch_projections[j+1](h).view(batch_size, self.hidden_dim, 4)
+            
+            # Upsample to match encoder feature size then concatenate with encoder features
+            d_up = F.interpolate(d_feat, size=encoded_features[j+1].size(2))
+            d_concat = torch.cat([d_up, encoded_features[j+1]], dim=1)
+            
+            # Apply decoder blocks
+            d_dec = self.decoder_blocks[j+1](d_concat)
+            
+            # Final layer and reshape to match original shape
+            d_out = self.output_layers[j+1](d_dec)
+            d_out = F.interpolate(d_out, size=d_shape[1])
+            d_out = d_out.squeeze(1)
+            d_outs.append(d_out)
         
-        # Combine into coefficient dictionary
-        reconstructed_coeffs = {
-            'a': a_rec,
-            'd': d_rec
+        # Return as coefficient dictionary
+        return {
+            'a': a_out,
+            'd': d_outs
         }
-        
-        return reconstructed_coeffs
 
 class WaveletEchoMatrix(nn.Module):
-    def __init__(self, wavelet='db4', levels=6, hidden_dim=128, latent_dim=256):
+    def __init__(self, wavelet='db4', levels=4, hidden_dim=64, latent_dim=256):
         super(WaveletEchoMatrix, self).__init__()
         self.wavelet = wavelet
         self.levels = levels
@@ -187,8 +239,8 @@ class WaveletEchoMatrix(nn.Module):
         self.idwt = IDWT(wave=wavelet)
         
         # Encoder and decoder
-        self.encoder = HierarchicalEncoder(levels=levels, hidden_dim=hidden_dim)
-        self.decoder = HierarchicalDecoder(levels=levels, hidden_dim=hidden_dim, latent_dim=latent_dim)
+        self.encoder = UnifiedEncoder(levels=levels, hidden_dim=hidden_dim)
+        self.decoder = UnifiedDecoder(levels=levels, hidden_dim=hidden_dim, latent_dim=latent_dim)
         
     def forward(self, x):
         """
@@ -207,17 +259,17 @@ class WaveletEchoMatrix(nn.Module):
             'd': [d.shape for d in coeffs['d']]
         }
         
-        # Normalize coefficients
+        # Normalize coefficients with improved stability
         norm_coeffs, stats = self.dwt.normalize_coeffs(coeffs)
         
-        # Apply thresholding for sparsity
+        # Apply adaptive thresholding for sparsity
         thresh_coeffs = self.dwt.threshold_coeffs(norm_coeffs)
         
         # Encode to latent space
-        z = self.encoder(thresh_coeffs)
+        z, encoded_features = self.encoder(thresh_coeffs)
         
-        # Decode from latent space
-        rec_coeffs = self.decoder(z, orig_shapes)
+        # Decode from latent space using skip connections
+        rec_coeffs = self.decoder(z, encoded_features, orig_shapes)
         
         # Denormalize coefficients using stored statistics
         denorm_coeffs = {

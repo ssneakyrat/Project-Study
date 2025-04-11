@@ -35,7 +35,7 @@ class WEMLightningModel(pl.LightningModule):
         return self.model(x)
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
+        optimizer = torch.optim.AdamW(  # Changed from Adam to AdamW for better weight decay handling
             self.parameters(),
             lr=self.config['learning_rate'],
             weight_decay=self.config['weight_decay']
