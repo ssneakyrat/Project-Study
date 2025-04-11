@@ -11,7 +11,6 @@ training:
   learning_rate: 0.001
   weight_decay: 0.00005
   max_epochs: 100
-  early_stopping_patience: 10
   gradient_clip_val: 1.0
   
 # Loss hyperparameters
@@ -32,6 +31,15 @@ precision: 16        # Use FP16 for faster training
 # Logging
 logging:
   log_every_n_steps: 50
+  logs_dir: 'logs'   # Directory for TensorBoard logs
+
+# Data generation parameters
+data_generation:
+  output_dir: 'data'
+  num_samples: 1000
+  sample_rate: 16000
+  duration: 2.0
+  split: [0.8, 0.1, 0.1]  # Train/val/test split
 
 # Seed for reproducibility
 seed: 42

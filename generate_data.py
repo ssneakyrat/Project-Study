@@ -2,6 +2,7 @@ import os
 import numpy as np
 import h5py
 import argparse
+import yaml
 from tqdm import tqdm
 
 def generate_sine_wave(freq, sample_rate, duration):
@@ -158,16 +159,21 @@ def create_dataset(output_dir, num_samples, sample_rate=16000, duration=2.0, spl
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate synthetic audio dataset")
-    parser.add_argument("--output_dir", type=str, default="data", help="Output directory")
-    parser.add_argument("--num_samples", type=int, default=1000, help="Number of samples to generate")
-    parser.add_argument("--sample_rate", type=int, default=16000, help="Sample rate in Hz")
-    parser.add_argument("--duration", type=float, default=2.0, help="Duration in seconds")
+    parser.add_argument("--config", type=str, default="config/model.yaml", help="Path to config file")
     
     args = parser.parse_args()
     
+    # Load configuration using PyYAML
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Get data generation parameters from config
+    data_gen_config = config['data_generation']
+    
     create_dataset(
-        output_dir=args.output_dir,
-        num_samples=args.num_samples,
-        sample_rate=args.sample_rate,
-        duration=args.duration
+        output_dir=data_gen_config['output_dir'],
+        num_samples=data_gen_config['num_samples'],
+        sample_rate=data_gen_config['sample_rate'],
+        duration=data_gen_config['duration'],
+        split=data_gen_config['split']
     )
