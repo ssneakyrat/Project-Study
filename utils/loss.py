@@ -5,9 +5,12 @@ import torch.nn.functional as F
 class WaveletLoss(nn.Module):
     """
     Combined loss function for the wavelet network:
-    Loss = MSE(x, x̂) + L1(W_ψ[x], W_ψ[x̂]) + KL(z, N(0,1))
+    Loss = α·MSE(x, x̂) + β·L1(W_ψ[x], W_ψ[x̂]) + γ·KL(z, N(0,1))
+    
+    Default weights match the architecture specification:
+    α=10.0, β=0.5, γ=0.1
     """
-    def __init__(self, wavelet_transform, mse_weight=1.0, wavelet_weight=1.0, kl_weight=0.1):
+    def __init__(self, wavelet_transform, mse_weight=10.0, wavelet_weight=0.5, kl_weight=0.1):
         super().__init__()
         self.wavelet_transform = wavelet_transform
         self.mse_weight = mse_weight

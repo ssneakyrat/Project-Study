@@ -17,8 +17,8 @@ training:
   max_epochs: 50
   gradient_accumulation: 1
   num_workers: 4
-  mse_weight: 1.0
-  wavelet_weight: 1.0
+  mse_weight: 10.0  # Updated to match architecture recommendation
+  wavelet_weight: 0.5  # Updated to match architecture recommendation
   kl_weight: 0.1
   vq_weight: 0.1
   lr_scheduler:  # Optional learning rate scheduler

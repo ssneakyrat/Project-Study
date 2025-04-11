@@ -16,18 +16,46 @@ class WaveletParameterNetwork(nn.Module):
         self.channels = channels
         self.kernel_size = kernel_size
         
-        # Fixed 3-layer MLP architecture with approximately 2K parameters
-        # Input dimension: 1 (time position)
-        # Hidden dimensions: 16, 32
-        # Output dimension: channels
-        self.mlp = nn.Sequential(
-            nn.Linear(1, 16),                # 1*16 + 16 = 32 parameters
-            nn.LeakyReLU(),
-            nn.Linear(16, 32),               # 16*32 + 32 = 544 parameters
-            nn.LeakyReLU(),
-            nn.Linear(32, channels),         # 32*channels + channels = 32*16 + 16 = 528 parameters
-            nn.Sigmoid()                     # Total: ~1104 parameters for channels=16
-        )
+        # Extract wavelet MLP layers from config
+        wavelet_mlp_layers = config['model'].get('wavelet_mlp_layers', [1, 32, 64, 32])
+        
+        # Ensure first layer is size 1 (time position)
+        wavelet_mlp_layers[0] = 1
+        
+        # Ensure last hidden layer can output to channels
+        if len(wavelet_mlp_layers) < 2:
+            wavelet_mlp_layers.append(32)
+        
+        # Build MLP layers dynamically from config
+        layers = []
+        for i in range(len(wavelet_mlp_layers) - 1):
+            in_dim = wavelet_mlp_layers[i]
+            out_dim = wavelet_mlp_layers[i + 1]
+            layers.append(nn.Linear(in_dim, out_dim))
+            
+            # Add activation except for last layer
+            if i < len(wavelet_mlp_layers) - 2:
+                layers.append(nn.LeakyReLU())
+        
+        # Add final output layer to match channels
+        layers.append(nn.Linear(wavelet_mlp_layers[-1], channels))
+        layers.append(nn.Sigmoid())
+        
+        self.mlp = nn.Sequential(*layers)
+        
+        # Calculate parameter count for verification
+        param_count = 0
+        for i in range(len(wavelet_mlp_layers) - 1):
+            in_dim = wavelet_mlp_layers[i]
+            out_dim = wavelet_mlp_layers[i + 1]
+            # Weight + bias parameters
+            param_count += (in_dim * out_dim + out_dim)
+        
+        # Final layer parameters
+        param_count += (wavelet_mlp_layers[-1] * channels + channels)
+        
+        # Set as attribute for debugging
+        self.param_count = param_count
         
     def forward(self, t):
         """
@@ -95,6 +123,25 @@ class AdaptiveWaveletTransform(nn.Module):
                 
                 # Normalize according to the wavelet transform formula: |a|^(-1/2)
                 wavelet = wavelet / torch.sqrt(scale) / torch.norm(wavelet)
+                
+                # Apply parameter symmetry constraints for wavelet admissibility
+                if self.kernel_size % 2 == 1:  # For odd kernel size
+                    center = self.kernel_size // 2
+                    # Ensure wavelet has zero mean (for admissibility)
+                    wavelet = wavelet - torch.mean(wavelet)
+                    
+                    # Apply symmetry/anti-symmetry based on wavelet type
+                    if wavelet_type == "morlet":
+                        # Anti-symmetric part for Morlet (imaginary component)
+                        anti_sym_part = (wavelet[:center] - wavelet[center+1:].flip(0)) / 2
+                        wavelet[:center] = anti_sym_part
+                        wavelet[center+1:] = -anti_sym_part.flip(0)
+                    else:
+                        # Ensure symmetry for Mexican hat and others
+                        sym_part = (wavelet[:center] + wavelet[center+1:].flip(0)) / 2
+                        wavelet[:center] = sym_part
+                        wavelet[center+1:] = sym_part.flip(0)
+                
                 self.filter_bank.weight[i, 0, :] = wavelet
                 
             # Only freeze weights if not using learnable wavelets

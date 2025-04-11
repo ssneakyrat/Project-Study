@@ -13,7 +13,6 @@ class InverseWaveletTransform(nn.Module):
         self.kernel_size = 101
         
         # Initialize synthesis filters (for inverse wavelet transform)
-        # Using complementary filters to the analysis filters for perfect reconstruction
         self.synthesis_filters = nn.ConvTranspose1d(
             channels, 1, kernel_size=self.kernel_size, stride=2, padding=self.kernel_size//2, bias=False
         )
@@ -27,7 +26,6 @@ class InverseWaveletTransform(nn.Module):
                 # Create synthesis filter that forms a dual frame with the analysis filter
                 if wavelet_type == "morlet":
                     # Dual frame of Morlet wavelet for perfect reconstruction
-                    # Using time-reversed and normalized version
                     morlet = torch.exp(-t**2/(2*scale**2)) * torch.cos(5*t/scale)
                     morlet = morlet.flip(0)  # Time reversal for dual frame
                     
@@ -43,7 +41,29 @@ class InverseWaveletTransform(nn.Module):
                 # Normalize synthesis filter for energy preservation
                 # |a|^(-1/2) factor from the wavelet transform definition
                 morlet = morlet / torch.sqrt(scale) / torch.norm(morlet)
+                
+                # Enforce symmetry constraints to maintain wavelet admissibility
+                if self.kernel_size % 2 == 1:  # For odd kernel size
+                    center = self.kernel_size // 2
+                    # Make filter symmetric around center for linear phase
+                    symmetric_part = (morlet[:center] + morlet[center+1:].flip(0)) / 2
+                    morlet[:center] = symmetric_part
+                    morlet[center+1:] = symmetric_part.flip(0)
+                
                 self.synthesis_filters.weight[i, 0, :] = morlet
+        
+        # Enforce perfect reconstruction condition: ∑_k h[k]h[2n-k] = δ[n]
+        # This is approximated by orthogonalization of the filters
+        with torch.no_grad():
+            # Extract filter weights
+            weights = self.synthesis_filters.weight.squeeze(1)  # [channels, kernel_size]
+            
+            # Orthogonalize filters using QR decomposition
+            q, r = torch.linalg.qr(weights.T)  # Transpose for QR
+            orthogonal_filters = q.T[:channels]  # First 'channels' rows, transposed back
+            
+            # Update filter weights
+            self.synthesis_filters.weight = nn.Parameter(orthogonal_filters.unsqueeze(1))
         
         # Adaptive modulation for synthesis
         self.modulation = nn.Conv1d(channels, channels, kernel_size=1)
@@ -86,9 +106,21 @@ class WaveletDecoder(pl.LightningModule):
         bottleneck_channels = config['model']['bottleneck_channels']
         hidden_channels = config['model']['hidden_channels']
         
-        # Upsampling: [B,256] → Linear → [B,256,125] → Transpose-Conv1D → [B,128,500]
-        self.initial_linear = nn.Linear(bottleneck_channels, bottleneck_channels * 125)
+        # Gradual upsampling as specified in architecture
+        # [B,256] → Linear → [B,256,16] → Linear → [B,256,64] → Linear → [B,256,125]
+        self.upsampling = nn.Sequential(
+            nn.Linear(bottleneck_channels, bottleneck_channels * 16),
+            nn.LeakyReLU(),
+            nn.Unflatten(1, (bottleneck_channels, 16)),
+            
+            nn.Linear(16, 64),
+            nn.LeakyReLU(),
+            
+            nn.Linear(64, 125),
+            nn.LeakyReLU(),
+        )
         
+        # [B,256,125] → Transpose-Conv1D → [B,128,500]
         self.upconv1 = nn.ConvTranspose1d(
             bottleneck_channels, 
             128, 
@@ -97,8 +129,8 @@ class WaveletDecoder(pl.LightningModule):
             padding=0
         )
         
-        # Reconstruction: 3×Transpose-Conv1D(kernel=4,stride=2) as specified in architecture
-        # [B,128,500] → [B,64,1000] → [B,32,2000] → [B,16,4000] → [B,8,8000]
+        # Reconstruction with exactly 3×Transpose-Conv1D layers as specified
+        # [B,128,500] → [B,64,1000] → [B,32,2000] → [B,8,8000]
         self.upconv2 = nn.ConvTranspose1d(
             128, 64, kernel_size=4, stride=2, padding=1
         )
@@ -107,15 +139,8 @@ class WaveletDecoder(pl.LightningModule):
             64, 32, kernel_size=4, stride=2, padding=1
         )
         
-        # Fixed: Split the single stride-4 operation into two stride-2 operations
-        # [B,32,2000] → [B,16,4000]
         self.upconv4 = nn.ConvTranspose1d(
-            32, 16, kernel_size=4, stride=2, padding=1
-        )
-        
-        # [B,16,4000] → [B,8,8000]
-        self.upconv5 = nn.ConvTranspose1d(
-            16, 8, kernel_size=4, stride=2, padding=1
+            32, 8, kernel_size=4, stride=4, padding=0
         )
         
         # Inverse wavelet transform: [B,8,8000] → [B,1,16000]
@@ -132,25 +157,21 @@ class WaveletDecoder(pl.LightningModule):
         z: [B, 256] bottleneck representation
         Returns: [B, 1, 16000] reconstructed audio
         """
-        # Upsampling: [B,256] → Linear → [B,256,125]
-        x = self.initial_linear(z)
-        x = x.view(x.shape[0], -1, 125)
+        # Upsampling: [B,256] → Reshape/Linear → [B,256,125]
+        x = self.upsampling(z)
         
         # [B,256,125] → Transpose-Conv1D → [B,128,500]
         x = F.relu(self.upconv1(x))
         
-        # Reconstruction: 4×Transpose-Conv1D as specified in architecture
+        # Reconstruction: 3×Transpose-Conv1D as specified in architecture
         # [B,128,500] → [B,64,1000]
         x = F.relu(self.upconv2(x))
         
         # [B,64,1000] → [B,32,2000]
         x = F.relu(self.upconv3(x))
         
-        # [B,32,2000] → [B,16,4000]
+        # [B,32,2000] → [B,8,8000] with a single stride 4 convolution
         x = F.relu(self.upconv4(x))
-        
-        # [B,16,4000] → [B,8,8000]
-        x = F.relu(self.upconv5(x))
         
         # Inverse wavelet transform: [B,8,8000] → [B,1,16000]
         x = self.inverse_wavelet(x)
