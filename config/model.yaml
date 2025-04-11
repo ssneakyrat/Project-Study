@@ -1,0 +1,23 @@
+# Audio settings
+sample_rate: 16000
+audio_length: 16000  # 1 second
+
+# Dataset settings
+n_training_samples: 100
+n_test_samples: 20
+batch_size: 16
+
+# Training settings
+epochs: 200
+learning_rate: 1e-3
+
+# Wavelet settings
+wavelet: 'db4'
+dwt_level: 3
+
+# Model architecture
+hidden_dims: [128, 64, 32]
+latent_dim: 16
+
+# Data storage
+data_dir: './data/audio'
