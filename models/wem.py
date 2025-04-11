@@ -24,6 +24,80 @@ class ResidualBlock(nn.Module):
         out = self.lrelu2(out)
         return out
 
+class AsymmetricFrequencyBlock(nn.Module):
+    """
+    Enhanced specialized block for high-frequency detail processing
+    with position-aware processing and left/right asymmetry
+    """
+    def __init__(self, channels, kernel_size=3):
+        super(AsymmetricFrequencyBlock, self).__init__()
+        self.norm1 = nn.BatchNorm1d(channels)
+        
+        # Split channels for direction-sensitive processing
+        self.channels_half = channels // 2
+        
+        # Direction-sensitive convolutions (left/right awareness)
+        # Using same padding for both to ensure consistent output sizes
+        self.conv_left = nn.Conv1d(self.channels_half, self.channels_half, 
+                                  kernel_size=5, padding=2)
+        self.conv_right = nn.Conv1d(self.channels_half, self.channels_half, 
+                                   kernel_size=5, padding=2)
+        
+        self.norm2 = nn.BatchNorm1d(channels)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=kernel_size//2)
+        
+        # Position-dependent attention mechanism
+        self.pos_attention = nn.Sequential(
+            nn.Conv1d(channels + 1, channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+        # Gating mechanism for adaptive detail preservation
+        self.gate = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+        # Gentler activation for high-frequency details
+        self.lrelu = nn.LeakyReLU(0.1)
+        
+    def forward(self, x):
+        residual = x
+        
+        # Normalization
+        out = self.norm1(x)
+        
+        # Split channels
+        out_left, out_right = torch.split(out, self.channels_half, dim=1)
+        
+        # Apply different processing to left and right channels
+        # but keeping sequence length consistent
+        out_left = self.conv_left(out_left)
+        out_right = self.conv_right(out_right)
+        
+        # Concatenate channels
+        out = torch.cat([out_left, out_right], dim=1)
+        
+        # Apply position-dependent attention
+        seq_len = out.size(2)
+        position_encoding = torch.linspace(0, 1, seq_len).view(1, 1, -1).to(out.device)
+        position_encoding = position_encoding.expand(out.size(0), 1, -1)
+        
+        # Generate position-dependent weights - emphasize different parts based on frequency
+        position_weights = self.pos_attention(torch.cat([out, position_encoding], dim=1))
+        out = out * position_weights
+        
+        # Second conv layer
+        out = self.lrelu(self.norm2(out))
+        out = self.conv2(out)
+        
+        # Adaptive gating for selective detail preservation
+        gate = self.gate(residual)
+        out = gate * out + (1 - gate) * residual
+        
+        out = self.lrelu(out)
+        return out
+
 class FrequencyAwareBlock(nn.Module):
     """
     Enhanced specialized block for high-frequency detail processing
@@ -120,11 +194,11 @@ class UnifiedEncoder(nn.Module):
         # Unified processing blocks with residual connections
         self.encoder_blocks = nn.ModuleList()
         for i in range(levels + 1):
-            if i < 3:  # High-frequency specific processing
+            if i < 3:  # High-frequency specific processing with asymmetric processing
                 self.encoder_blocks.append(
                     nn.Sequential(
-                        FrequencyAwareBlock(hidden_dim),
-                        FrequencyAwareBlock(hidden_dim)
+                        AsymmetricFrequencyBlock(hidden_dim),
+                        AsymmetricFrequencyBlock(hidden_dim)
                     )
                 )
             else:
@@ -220,6 +294,7 @@ class UnifiedEncoder(nn.Module):
 class UnifiedDecoder(nn.Module):
     """
     Enhanced unified decoder with better detail reconstruction capabilities
+    and position-aware processing for different frequency bands
     """
     def __init__(self, levels=4, hidden_dim=64, latent_dim=256):
         super(UnifiedDecoder, self).__init__()
@@ -257,15 +332,14 @@ class UnifiedDecoder(nn.Module):
         # Unified decoder blocks with residual connections
         self.decoder_blocks = nn.ModuleList()
         for i in range(levels + 1):
-            if i < 3:  # High-frequency specific processing
-                # Enhanced processing for high frequencies with FrequencyAwareBlocks
+            if i < 3:  # High-frequency specific processing with asymmetric blocks
                 self.decoder_blocks.append(
                     nn.Sequential(
                         nn.Conv1d(hidden_dim*2, hidden_dim, kernel_size=3, padding=1),
                         nn.BatchNorm1d(hidden_dim),
                         nn.LeakyReLU(0.1),
-                        FrequencyAwareBlock(hidden_dim, kernel_size=3),
-                        FrequencyAwareBlock(hidden_dim, kernel_size=3)
+                        AsymmetricFrequencyBlock(hidden_dim, kernel_size=3),
+                        AsymmetricFrequencyBlock(hidden_dim, kernel_size=3)
                     )
                 )
             else:
@@ -333,10 +407,12 @@ class UnifiedDecoder(nn.Module):
             d_shape = orig_shapes['d'][j]
             d_feat = self.branch_projections[j+1](h).view(batch_size, self.hidden_dim, 4)
             
-            # Enhanced upsampling for high-frequency components
+            # Enhanced multi-scale upsampling for high-frequency components
             if j < 3:  # High-frequency specific handling
-                # Better interpolation mode for high-frequency components
-                d_up = F.interpolate(d_feat, size=encoded_features[j+1].size(2), mode='linear')
+                # Progressive upsampling for better detail preservation
+                d_up1 = F.interpolate(d_feat, size=encoded_features[j+1].size(2)//4, mode='linear')
+                d_up2 = F.interpolate(d_up1, size=encoded_features[j+1].size(2)//2, mode='linear')
+                d_up = F.interpolate(d_up2, size=encoded_features[j+1].size(2), mode='linear')
             else:
                 d_up = F.interpolate(d_feat, size=encoded_features[j+1].size(2))
                 
@@ -351,6 +427,28 @@ class UnifiedDecoder(nn.Module):
             # Enhanced interpolation for high frequencies
             if j < 3:
                 d_out = F.interpolate(d_out, size=d_shape[1], mode='linear')
+                
+                # Apply position-dependent gain correction to address observed imbalances
+                position_weights = torch.ones((1, 1, d_shape[1]), device=d_out.device)
+                
+                if j == 0:  # Level 1 (80% left reconstruction) - boost right side
+                    # Create linear weights that increase from left (1.0) to right (2.0)
+                    right_boost = torch.linspace(1.0, 2.0, d_shape[1], device=d_out.device)
+                    position_weights = right_boost.view(1, 1, -1)
+                elif j == 1:  # Level 2 (50% right reconstruction) - boost right side more
+                    # Create weights emphasizing the right side
+                    mid_point = d_shape[1] // 2
+                    left_weights = torch.ones(mid_point, device=d_out.device)
+                    right_weights = torch.linspace(1.0, 2.5, d_shape[1] - mid_point, device=d_out.device)
+                    position_weights = torch.cat([left_weights, right_weights], dim=0).view(1, 1, -1)
+                elif j == 2:  # Level 3 (30% right reconstruction) - strong right boost
+                    # Create weights with stronger emphasis on the right side
+                    position_weights = torch.ones((1, 1, d_shape[1]), device=d_out.device)
+                    right_start = int(0.6 * d_shape[1])
+                    position_weights[:, :, right_start:] = 3.0
+                
+                # Apply position-dependent weights
+                d_out = d_out * position_weights
             else:
                 d_out = F.interpolate(d_out, size=d_shape[1])
                 

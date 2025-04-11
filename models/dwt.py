@@ -87,9 +87,32 @@ class DWT(torch.nn.Module):
             
         return normalized_coeffs, stats
     
+    def _position_adaptive_scale(self, level, rel_position):
+        """
+        Generate position-dependent scaling factor for thresholding
+        Args:
+            level: Wavelet decomposition level
+            rel_position: Relative position (0.0 to 1.0)
+        Returns:
+            scale: Position-dependent scaling factor
+        """
+        # Different scaling patterns for different levels to address the observed issues
+        if level == 0:  # Level 1 (highest frequency) - 80% left reconstruction
+            # Gradually increase threshold from left to right (lower threshold = more detail preserved)
+            return 0.6 + 0.8 * rel_position  # 0.6 at left, 1.4 at right
+        elif level == 1:  # Level 2 - 50% right reconstruction
+            # Gradually decrease threshold from left to right
+            return 1.4 - 0.8 * rel_position  # 1.4 at left, 0.6 at right
+        elif level == 2:  # Level 3 - 30% right reconstruction
+            # Similar pattern to level 2 but more pronounced
+            return 1.6 - 1.0 * rel_position  # 1.6 at left, 0.6 at right
+        else:
+            # Neutral scaling for other levels
+            return 1.0
+    
     def threshold_coeffs(self, coeffs, lambda_values=None):
         """
-        Apply adaptive thresholding to coefficients with frequency-aware scaling
+        Apply position-aware adaptive thresholding to coefficients
         Args:
             coeffs: Dictionary of wavelet coefficients
             lambda_values: Optional threshold parameters
@@ -109,13 +132,18 @@ class DWT(torch.nn.Module):
             std_d = torch.std(d, dim=1, keepdim=True)
             
             # Frequency-aware adaptive scaling factor (gentler on high frequencies)
-            # Scale factor decreases for higher frequency bands (lower j value)
-            # Mathematical scaling: higher frequencies (j=0) get lowest threshold (0.2)
-            # while lower frequencies get higher thresholds
             scale_factor = max(0.2, 1.0 - 0.2 * (self.level - j - 1))
             
-            # Universal threshold T = λ * σ * sqrt(2 * log(N)) * scale_factor
-            T = scale_factor * lambda_values[j] * std_d * torch.sqrt(torch.tensor(2.0 * np.log(N), device=d.device))
+            # Create position-dependent threshold mask
+            position_mask = torch.ones((batch_size, N), device=d.device)
+            for pos in range(N):
+                # Get position-adaptive scale for this level and relative position
+                pos_scale = self._position_adaptive_scale(j, pos/N)
+                position_mask[:, pos] = pos_scale
+            
+            # Universal threshold with position-aware scaling
+            T_base = scale_factor * lambda_values[j] * std_d * torch.sqrt(torch.tensor(2.0 * np.log(N), device=d.device))
+            T = T_base * position_mask.unsqueeze(1) if len(T_base.shape) > 2 else T_base * position_mask
             
             # Soft thresholding with proper broadcasting: sign(x) * max(|x| - T, 0)
             d_abs = torch.abs(d)
