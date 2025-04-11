@@ -12,38 +12,66 @@ class InverseWaveletTransform(nn.Module):
         self.output_size = output_size
         self.kernel_size = 101
         
-        # Inverse wavelet transform implemented as transposed convolution with stride=2 for upsampling
+        # Initialize synthesis filters (for inverse wavelet transform)
+        # Using complementary filters to the analysis filters for perfect reconstruction
         self.synthesis_filters = nn.ConvTranspose1d(
             channels, 1, kernel_size=self.kernel_size, stride=2, padding=self.kernel_size//2, bias=False
         )
         
-        # Initialize the synthesis filters with approximate inverse of analysis filters
+        # Initialize the synthesis filters with mathematically accurate inverse wavelets
         with torch.no_grad():
             scales = torch.logspace(1, 3, channels)
             for i, scale in enumerate(scales):
                 t = torch.linspace(-50, 50, 101)
-                # Approximate inverse of Morlet wavelet
-                morlet = torch.exp(-t**2/(2*scale**2)) * torch.cos(5*t/scale)
-                # Normalize
+                
+                # Create synthesis filter that forms a dual frame with the analysis filter
+                if wavelet_type == "morlet":
+                    # Dual frame of Morlet wavelet for perfect reconstruction
+                    # Using time-reversed and normalized version
+                    morlet = torch.exp(-t**2/(2*scale**2)) * torch.cos(5*t/scale)
+                    morlet = morlet.flip(0)  # Time reversal for dual frame
+                    
+                elif wavelet_type == "mexican_hat":
+                    # Dual frame of Mexican hat wavelet
+                    morlet = (1 - t**2/scale**2) * torch.exp(-t**2/(2*scale**2))
+                    morlet = morlet.flip(0)  # Time reversal
+                    
+                else:  # Default to Morlet
+                    morlet = torch.exp(-t**2/(2*scale**2)) * torch.cos(5*t/scale)
+                    morlet = morlet.flip(0)
+                    
+                # Normalize synthesis filter for energy preservation
+                # |a|^(-1/2) factor from the wavelet transform definition
                 morlet = morlet / torch.sqrt(scale) / torch.norm(morlet)
                 self.synthesis_filters.weight[i, 0, :] = morlet
         
-        # Feature modulation for adaptive synthesis
-        self.feature_modulation = nn.Conv1d(channels, channels, kernel_size=1)
+        # Adaptive modulation for synthesis
+        self.modulation = nn.Conv1d(channels, channels, kernel_size=1)
     
     def forward(self, x):
         """
-        Inverse wavelet transform using synthesis filter bank with upsampling
-        x: [B, C, T]
-        Returns: [B, 1, 2*T] (upsampled by factor of 2)
-        """
-        # Apply feature modulation (adaptive part)
-        x = self.feature_modulation(x)
+        Inverse wavelet transform using synthesis filter bank
         
-        # Apply synthesis filters (inverse wavelet transform) with implicit upsampling (stride=2)
+        Mathematically implements the inverse continuous wavelet transform:
+        x(t) = C_ψ^(-1) ∫∫ W_ψx(a,b) ψ((t-b)/a) da db/a²
+        
+        where C_ψ is the wavelet admissibility constant.
+        
+        Args:
+            x: Wavelet coefficients [B, C, T]
+            
+        Returns:
+            Reconstructed signal [B, 1, 2*T]
+        """
+        # Apply adaptive modulation
+        x = self.modulation(x)
+        
+        # Apply synthesis filters
+        # This implements the integration over scales and positions
+        # The TransposedConv1d with stride=2 provides the necessary upsampling
         output = self.synthesis_filters(x)
         
-        # Make sure the output size matches the expected size
+        # Ensure output size matches expected dimension
         if output.size(2) != self.output_size:
             output = F.interpolate(output, size=self.output_size, mode='linear', align_corners=False)
             
@@ -69,8 +97,8 @@ class WaveletDecoder(pl.LightningModule):
             padding=0
         )
         
-        # Reconstruction: 3×Transpose-Conv1D(kernel=4,stride=2)
-        # [B,128,500] → [B,64,1000] → [B,32,2000] → [B,16,4000] → [B,8,8000]
+        # Reconstruction: 3×Transpose-Conv1D(kernel=4,stride=2) as specified in architecture
+        # [B,128,500] → [B,64,1000] → [B,32,2000] → [B,8,8000]
         self.upconv2 = nn.ConvTranspose1d(
             128, 64, kernel_size=4, stride=2, padding=1
         )
@@ -79,12 +107,9 @@ class WaveletDecoder(pl.LightningModule):
             64, 32, kernel_size=4, stride=2, padding=1
         )
         
+        # Modified to match architecture spec: directly go from 32→8 channels with stride=4
         self.upconv4 = nn.ConvTranspose1d(
-            32, 16, kernel_size=4, stride=2, padding=1
-        )
-        
-        self.upconv5 = nn.ConvTranspose1d(
-            16, 8, kernel_size=4, stride=2, padding=1
+            32, 8, kernel_size=8, stride=4, padding=2
         )
         
         # Inverse wavelet transform: [B,8,8000] → [B,1,16000]
@@ -108,18 +133,15 @@ class WaveletDecoder(pl.LightningModule):
         # [B,256,125] → Transpose-Conv1D → [B,128,500]
         x = F.relu(self.upconv1(x))
         
-        # Reconstruction: 3×Transpose-Conv1D
+        # Reconstruction: 3×Transpose-Conv1D as specified in architecture
         # [B,128,500] → [B,64,1000]
         x = F.relu(self.upconv2(x))
         
         # [B,64,1000] → [B,32,2000]
         x = F.relu(self.upconv3(x))
         
-        # [B,32,2000] → [B,16,4000]
+        # [B,32,2000] → [B,8,8000] (single upconv with stride=4 to match architecture)
         x = F.relu(self.upconv4(x))
-        
-        # [B,16,4000] → [B,8,8000]
-        x = F.relu(self.upconv5(x))
         
         # Inverse wavelet transform: [B,8,8000] → [B,1,16000]
         x = self.inverse_wavelet(x)

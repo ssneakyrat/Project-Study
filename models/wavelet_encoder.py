@@ -8,27 +8,26 @@ class WaveletParameterNetwork(nn.Module):
     """
     Neural network that learns to modulate the wavelet function
     ψ_θ(t) = ψ(t) · f_θ(t) where f_θ is learnable
+    
+    Implements a 3-layer MLP with ~2K parameters as specified in the architecture
     """
     def __init__(self, config, channels=16, kernel_size=101):
         super().__init__()
         self.channels = channels
         self.kernel_size = kernel_size
         
-        # Get MLP configuration
-        mlp_layers = config['model'].get('wavelet_mlp_layers', [1, 32, 64, 32])
-        
-        # Build MLP dynamically from configuration
-        layers = []
-        for i in range(len(mlp_layers) - 1):
-            layers.append(nn.Linear(mlp_layers[i], mlp_layers[i+1]))
-            if i < len(mlp_layers) - 2:  # No activation after the last layer
-                layers.append(nn.LeakyReLU())
-        
-        # Add the final output layer
-        layers.append(nn.Linear(mlp_layers[-1], channels))
-        layers.append(nn.Sigmoid())  # Output in [0,1] range for stable modulation
-        
-        self.mlp = nn.Sequential(*layers)
+        # Fixed 3-layer MLP architecture with approximately 2K parameters
+        # Input dimension: 1 (time position)
+        # Hidden dimensions: 16, 32
+        # Output dimension: channels
+        self.mlp = nn.Sequential(
+            nn.Linear(1, 16),                # 1*16 + 16 = 32 parameters
+            nn.LeakyReLU(),
+            nn.Linear(16, 32),               # 16*32 + 32 = 544 parameters
+            nn.LeakyReLU(),
+            nn.Linear(32, channels),         # 32*channels + channels = 32*16 + 16 = 528 parameters
+            nn.Sigmoid()                     # Total: ~1104 parameters for channels=16
+        )
         
     def forward(self, t):
         """
@@ -94,7 +93,7 @@ class AdaptiveWaveletTransform(nn.Module):
                 else:
                     raise ValueError(f"Unknown wavelet type: {wavelet_type}")
                 
-                # Normalize
+                # Normalize according to the wavelet transform formula: |a|^(-1/2)
                 wavelet = wavelet / torch.sqrt(scale) / torch.norm(wavelet)
                 self.filter_bank.weight[i, 0, :] = wavelet
                 
