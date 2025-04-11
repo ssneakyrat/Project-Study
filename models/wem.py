@@ -39,7 +39,6 @@ class HierarchicalEncoder(nn.Module):
             self.detail_encoders.append(encoder)
         
         # Fusion layer (to combine all encoded branches)
-        # The input size depends on the number of levels and hidden_dim
         fusion_input_size = hidden_dim * (levels + 1)  # +1 for approximation coeffs
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_size, 512),
@@ -94,27 +93,42 @@ class HierarchicalDecoder(nn.Module):
             nn.LeakyReLU(0.2)
         )
         
-        # Branch-specific decoders for approximation coefficients
+        # Branch distribution layers - small linear projections to create branch-specific features
+        self.approx_features = nn.Linear(512, hidden_dim)
+        self.detail_features = nn.ModuleList([nn.Linear(512, hidden_dim) for _ in range(levels)])
+        
+        # Parameter-efficient decoder for approximation coefficients
         self.approx_decoder = nn.Sequential(
-            nn.Linear(512, hidden_dim * 512 // 8),
+            nn.ConvTranspose1d(hidden_dim, hidden_dim // 2, kernel_size=4, stride=2, padding=1),
             nn.LeakyReLU(0.2),
-            nn.Unflatten(1, (hidden_dim, 512 // 8)),
-            nn.ConvTranspose1d(hidden_dim, 1, kernel_size=3, padding=1)
+            nn.ConvTranspose1d(hidden_dim // 2, hidden_dim // 4, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.ConvTranspose1d(hidden_dim // 4, 1, kernel_size=4, stride=2, padding=1)
         )
         
-        # Branch-specific decoders for detail coefficients
+        # Create efficient decoders for detail coefficients at each level
+        # Each decoder uses a different number of upsampling operations based on its target size
         self.detail_decoders = nn.ModuleList()
         for i in range(levels):
-            # Calculate the output size for each level (based on wavelet decomposition)
-            output_size = 32000 // (2 ** (levels - i))
+            # Number of upsampling operations needed for this level
+            # More upsampling for higher frequency detail coefficients
+            num_upsample = min(5, levels - i + 2)  # Empirical formula
             
-            decoder = nn.Sequential(
-                nn.Linear(512, hidden_dim * output_size // 8),
-                nn.LeakyReLU(0.2),
-                nn.Unflatten(1, (hidden_dim, output_size // 8)),
-                nn.ConvTranspose1d(hidden_dim, 1, kernel_size=3, padding=1)
-            )
-            self.detail_decoders.append(decoder)
+            layers = []
+            in_channels = hidden_dim
+            
+            for j in range(num_upsample):
+                out_channels = max(hidden_dim // (2 ** (j+1)), 8)  # Decrease channels as we upsample
+                layers.extend([
+                    nn.ConvTranspose1d(in_channels, out_channels, kernel_size=4, stride=2, padding=1),
+                    nn.LeakyReLU(0.2)
+                ])
+                in_channels = out_channels
+            
+            # Final layer to output 1 channel
+            layers.append(nn.Conv1d(in_channels, 1, kernel_size=3, padding=1))
+            
+            self.detail_decoders.append(nn.Sequential(*layers))
         
     def forward(self, z, orig_shapes):
         """
@@ -130,17 +144,24 @@ class HierarchicalDecoder(nn.Module):
         # Initial expansion
         h = self.initial_expansion(z)
         
-        # Reconstruct approximation coefficients
+        # Generate features for approximation coefficients
+        a_features = self.approx_features(h).view(batch_size, -1, 1)  # [B, hidden_dim, 1]
+        
+        # Decode approximation coefficients
         a_shape = orig_shapes['a']
-        a_rec = self.approx_decoder(h)
+        a_rec = self.approx_decoder(a_features)
         a_rec = F.interpolate(a_rec, size=a_shape[1])
         a_rec = a_rec.squeeze(1)  # [B, T]
         
         # Reconstruct detail coefficients for each level
         d_rec = []
         for j in range(self.levels):
+            # Get level-specific features
+            d_features = self.detail_features[j](h).view(batch_size, -1, 1)  # [B, hidden_dim, 1]
+            
+            # Apply decoder
             d_shape = orig_shapes['d'][j]
-            d = self.detail_decoders[j](h)
+            d = self.detail_decoders[j](d_features)
             d = F.interpolate(d, size=d_shape[1])
             d = d.squeeze(1)  # [B, T]
             d_rec.append(d)
