@@ -5,21 +5,27 @@ import torch.nn.functional as F
 class WaveletLoss(nn.Module):
     """
     Combined loss function for the wavelet network:
-    Loss = α·MSE(x, x̂) + β·L1(W_ψ[x], W_ψ[x̂]) + γ·KL(z, N(0,1))
+    Loss = α·MSE(x, x̂) + β·L1(W_ψ[x], W_ψ[x̂]) + γ·KL(z, N(0,1)) + λ·L_temp
     
     Default weights match the architecture specification:
-    α=10.0, β=0.5, γ=0.1
+    α=10.0, β=0.5, γ=0.1, λ=1.0
+    
+    Temporal consistency loss L_temp = MSE(x̂_{t,overlap}, x̂_{t+1,overlap})
+    enforces consistency in overlapping parts of reconstructed segments.
     """
-    def __init__(self, wavelet_transform, mse_weight=10.0, wavelet_weight=0.5, kl_weight=0.1):
+    def __init__(self, wavelet_transform, mse_weight=10.0, wavelet_weight=0.5, 
+                 kl_weight=0.1, temporal_weight=1.0, overlap_factor=0.25):
         super().__init__()
         self.wavelet_transform = wavelet_transform
         self.mse_weight = mse_weight
         self.wavelet_weight = wavelet_weight
         self.kl_weight = kl_weight
+        self.temporal_weight = temporal_weight
+        self.overlap_factor = overlap_factor
     
-    def forward(self, x, x_hat, z=None, z_mean=None, z_logvar=None):
+    def forward(self, x, x_hat, z=None, z_mean=None, z_logvar=None, x_hat_prev=None):
         """
-        Compute the combined loss.
+        Compute the combined loss with temporal consistency.
         
         Args:
             x: Original signal [B, 1, T]
@@ -27,6 +33,7 @@ class WaveletLoss(nn.Module):
             z: Latent vector (optional)
             z_mean: Mean of latent space for KL divergence
             z_logvar: Log variance of latent space for KL divergence
+            x_hat_prev: Previous reconstructed frame for temporal consistency loss
             
         Returns:
             Total loss and dictionary of individual loss components
@@ -46,6 +53,25 @@ class WaveletLoss(nn.Module):
         # Initialize total loss
         total_loss = self.mse_weight * mse_loss + self.wavelet_weight * wavelet_loss
         
+        # Initialize temporal loss
+        temporal_loss = 0.0
+        
+        # Add temporal consistency loss if previous frame is available
+        if x_hat_prev is not None:
+            # Calculate overlap size
+            T = x_hat.size(2)
+            overlap_size = int(T * self.overlap_factor)
+            
+            # Current frame's beginning should match previous frame's end
+            current_begin = x_hat[:, :, :overlap_size]
+            prev_end = x_hat_prev[:, :, -overlap_size:]
+            
+            # Compute MSE on overlapping regions
+            temporal_loss = F.mse_loss(current_begin, prev_end)
+            
+            # Add to total loss
+            total_loss += self.temporal_weight * temporal_loss
+        
         # Add KL divergence term if provided
         kl_loss = 0.0
         if z_mean is not None and z_logvar is not None:
@@ -63,7 +89,30 @@ class WaveletLoss(nn.Module):
         loss_components = {
             "mse_loss": mse_loss.item(),
             "wavelet_loss": wavelet_loss.item(),
-            "kl_loss": kl_loss if isinstance(kl_loss, float) else kl_loss.item()
+            "kl_loss": kl_loss if isinstance(kl_loss, float) else kl_loss.item(),
+            "temporal_loss": temporal_loss if isinstance(temporal_loss, float) else temporal_loss.item()
         }
         
         return total_loss, loss_components
+
+
+class TriangularWindow(nn.Module):
+    """
+    Creates a triangular window for overlap-add synthesis
+    """
+    def __init__(self, window_length):
+        super().__init__()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Create triangular window that sums to 1.0 when overlapped
+        # First half rises linearly, second half falls linearly
+        ramp_up = torch.linspace(0, 1, window_length // 2, device=device)
+        ramp_down = torch.linspace(1, 0, window_length // 2 + window_length % 2, device=device)
+        window = torch.cat([ramp_up, ramp_down], dim=0)
+        
+        # Register as buffer (non-trainable)
+        self.register_buffer('window', window.unsqueeze(0).unsqueeze(0))  # [1, 1, T]
+    
+    def forward(self, x):
+        """Apply window to input tensor"""
+        return x * self.window

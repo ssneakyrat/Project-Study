@@ -9,6 +9,8 @@ model:
   use_vq: false  # Whether to use Vector Quantization
   num_embeddings: 512  # Number of codebook entries for VQ
   condition_dim: 256  # Dimension of conditioning embeddings
+  use_temporal: true  # Whether to use BiGRU temporal modeling
+  use_overlap: true  # Whether to use overlapping frame processing
 
 # Training parameters
 training:
@@ -17,9 +19,10 @@ training:
   max_epochs: 50
   gradient_accumulation: 1
   num_workers: 4
-  mse_weight: 10.0  # Updated to match architecture recommendation
-  wavelet_weight: 0.5  # Updated to match architecture recommendation
-  kl_weight: 0.1
+  mse_weight: 10.0  # Architecture recommendation: α=10.0
+  wavelet_weight: 0.5  # Architecture recommendation: β=0.5
+  kl_weight: 0.1  # Architecture recommendation: γ=0.1
+  temporal_weight: 1.0  # Architecture recommendation: λ=1.0
   vq_weight: 0.1
   lr_scheduler:  # Optional learning rate scheduler
     type: "step"  # Options: step, cosine

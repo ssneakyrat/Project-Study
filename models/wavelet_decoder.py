@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import pytorch_lightning as pl
+from utils.loss import TriangularWindow
 
 class InverseWaveletTransform(nn.Module):
     def __init__(self, config, wavelet_type="morlet", channels=8, output_size=16000):
@@ -53,17 +54,28 @@ class InverseWaveletTransform(nn.Module):
                 self.synthesis_filters.weight[i, 0, :] = morlet
         
         # Enforce perfect reconstruction condition: ∑_k h[k]h[2n-k] = δ[n]
-        # This is approximated by orthogonalization of the filters
         with torch.no_grad():
-            # Extract filter weights
+            # Get filter weights
             weights = self.synthesis_filters.weight.squeeze(1)  # [channels, kernel_size]
             
-            # Orthogonalize filters using QR decomposition
-            q, r = torch.linalg.qr(weights.T)  # Transpose for QR
-            orthogonal_filters = q.T[:channels]  # First 'channels' rows, transposed back
+            # Orthogonalize the filter bank for improved perfect reconstruction
+            # Step 1: Compute filter inner products (Gram matrix)
+            gram = torch.mm(weights, weights.t())
+            
+            # Step 2: Apply Cholesky decomposition-based orthogonalization
+            # Add small diagonal term for numerical stability
+            gram += torch.eye(channels, device=weights.device) * 1e-6
+            L = torch.linalg.cholesky(gram)
+            
+            # Step 3: Solve the system (updated to use the newer API)
+            ortho_weights = torch.linalg.solve(L, weights)
+            
+            # Step 4: Normalize each filter
+            for i in range(channels):
+                ortho_weights[i] = ortho_weights[i] / torch.norm(ortho_weights[i])
             
             # Update filter weights
-            self.synthesis_filters.weight = nn.Parameter(orthogonal_filters.unsqueeze(1))
+            self.synthesis_filters.weight = nn.Parameter(ortho_weights.unsqueeze(1))
         
         # Adaptive modulation for synthesis
         self.modulation = nn.Conv1d(channels, channels, kernel_size=1)
@@ -150,6 +162,15 @@ class WaveletDecoder(pl.LightningModule):
             channels=8,
             output_size=config['model']['input_size']
         )
+        
+        # Triangular window for overlap-add reconstruction
+        self.window = TriangularWindow(config['model']['input_size'])
+        
+        # Track previous frame for overlapping - starts as None
+        self.prev_frame = None
+        
+        # Overlap factor for frame processing
+        self.overlap_factor = 0.25  # From architecture specification
     
     def forward(self, z):
         """
@@ -177,6 +198,69 @@ class WaveletDecoder(pl.LightningModule):
         x = self.inverse_wavelet(x)
         
         return x
+    
+    def process_overlapping_frames(self, frame):
+        """
+        Process overlapping frames with triangular windowing for smooth reconstruction
+        Implements: x̂ = ∑_t w_t · x̂_t where w_t is a triangular window
+        
+        Args:
+            frame: Current reconstructed frame [B, 1, T]
+            
+        Returns:
+            Processed frame with overlap-add if previous frame exists
+        """
+        # Apply triangular window to current frame
+        windowed_frame = self.window(frame)
+        
+        # If no previous frame, store current and return as is
+        if self.prev_frame is None:
+            self.prev_frame = frame.detach()
+            return windowed_frame
+            
+        # Calculate overlap size
+        T = frame.size(2)
+        overlap_size = int(T * self.overlap_factor)
+        
+        # Create output buffer
+        output = torch.zeros_like(frame)
+        
+        # Copy previous frame's end (with overlap)
+        output[:, :, :overlap_size] = self.prev_frame[:, :, -overlap_size:]
+        
+        # Add overlapping region with windowing for smooth transition
+        output[:, :, :overlap_size] += windowed_frame[:, :, :overlap_size]
+        
+        # Copy remaining part of current frame
+        output[:, :, overlap_size:] = windowed_frame[:, :, overlap_size:]
+        
+        # Store current frame for next iteration
+        self.prev_frame = frame.detach()
+        
+        return output
+    
+    def encode_decode(self, z, use_overlap=True):
+        """
+        Decode with optional overlap-add processing
+        
+        Args:
+            z: Latent vector [B, 256]
+            use_overlap: Whether to use overlap-add processing
+            
+        Returns:
+            Reconstructed signal and previous frame for loss calculation
+        """
+        # Decode the latent vector
+        x_hat = self(z)
+        
+        # Store previous frame for loss calculation
+        prev_frame = self.prev_frame
+        
+        # Apply overlap-add processing if requested
+        if use_overlap:
+            x_hat = self.process_overlapping_frames(x_hat)
+        
+        return x_hat, prev_frame
     
     def training_step(self, batch, batch_idx):
         x = batch

@@ -15,6 +15,18 @@ class LatentProcessor(pl.LightningModule):
         # Define condition dimension - can be configured or default to latent_dim
         self.condition_dim = config.get('model', {}).get('condition_dim', self.latent_dim)
         
+        # BiGRU for temporal modeling as specified in the architecture
+        # BiGRU(hidden=256) → [B,256]
+        self.use_temporal = config.get('model', {}).get('use_temporal', True)
+        if self.use_temporal:
+            self.bigru = nn.GRU(
+                input_size=self.latent_dim,
+                hidden_size=self.latent_dim // 2,  # Divided by 2 because bidirectional
+                num_layers=1,
+                batch_first=True,
+                bidirectional=True
+            )
+        
         # MLP for condition processing
         # Following the parameter breakdown (~500K parameters for latent processing)
         self.condition_mlp = nn.Sequential(
@@ -36,15 +48,33 @@ class LatentProcessor(pl.LightningModule):
     
     def forward(self, z, condition=None):
         """
-        Process the latent vector with optional conditioning
+        Process the latent vector with optional conditioning and temporal modeling
         
         Args:
-            z: Latent vector from encoder [B, latent_dim]
+            z: Latent vector from encoder [B, latent_dim] or [B, T, latent_dim]
             condition: Conditioning vector [B, condition_dim] or None
             
         Returns:
             Processed latent vector [B, latent_dim]
         """
+        batch_size = z.size(0)
+        
+        # Apply temporal modeling if enabled and input has temporal dimension
+        if self.use_temporal:
+            # If z doesn't have temporal dimension, add one
+            if z.dim() == 2:
+                z = z.unsqueeze(1)  # [B, latent_dim] -> [B, 1, latent_dim]
+                
+            # Apply BiGRU: Captures inter-frame dependencies as per architecture
+            # h_t = BiGRU(z_t, h_{t-1})
+            z, _ = self.bigru(z)
+            
+            # Take the last temporal output or mean across time
+            if z.size(1) == 1:
+                z = z.squeeze(1)  # [B, 1, latent_dim] -> [B, latent_dim]
+            else:
+                z = z.mean(dim=1)  # Average across temporal dimension
+        
         # If no condition provided, return z unchanged or apply VQ if enabled
         if condition is None:
             if self.use_vq:
@@ -59,6 +89,7 @@ class LatentProcessor(pl.LightningModule):
         condition_embedding = self.condition_mlp(condition)
         
         # Apply conditioning: z' = z + MLP(condition)
+        # Direct latent manipulation as per architecture
         z_conditioned = z + condition_embedding
         
         # Apply VQ if enabled

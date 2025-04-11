@@ -39,13 +39,21 @@ class AdaptiveWaveletNetwork(pl.LightningModule):
         # Initialize loss function
         self.loss_fn = WaveletLoss(
             wavelet_transform=self.wavelet_transform,
-            mse_weight=config.get('training', {}).get('mse_weight', 1.0),
-            wavelet_weight=config.get('training', {}).get('wavelet_weight', 1.0),
-            kl_weight=config.get('training', {}).get('kl_weight', 0.1)
+            mse_weight=config.get('training', {}).get('mse_weight', 10.0),
+            wavelet_weight=config.get('training', {}).get('wavelet_weight', 0.5),
+            kl_weight=config.get('training', {}).get('kl_weight', 0.1),
+            temporal_weight=config.get('training', {}).get('temporal_weight', 1.0),
+            overlap_factor=0.25  # As specified in architecture
         )
         
         # Flag for using conditioning
         self.use_conditioning = config.get('data', {}).get('use_conditioning', False)
+        
+        # Flag for using overlapping frames processing
+        self.use_overlap = config.get('model', {}).get('use_overlap', True)
+        
+        # Track previous reconstructed frame for temporal consistency loss
+        self.prev_reconstructed = None
     
     def forward(self, x, condition=None):
         """
@@ -64,8 +72,8 @@ class AdaptiveWaveletNetwork(pl.LightningModule):
         # Process latent with optional conditioning
         z_processed = self.processor(z, condition)
         
-        # Decode back to audio
-        x_hat = self.decoder(z_processed)
+        # Decode back to audio with overlap-add
+        x_hat, prev_frame = self.decoder.encode_decode(z_processed, use_overlap=self.use_overlap)
         
         return x_hat, z, z_mean, z_logvar
     
@@ -79,15 +87,21 @@ class AdaptiveWaveletNetwork(pl.LightningModule):
         return x, condition
     
     def training_step(self, batch, batch_idx):
-        """Training step"""
+        """Training step with temporal processing"""
         # Get input
         x, condition = self._get_batch_input(batch)
         
         # Forward pass
         x_hat, z, z_mean, z_logvar = self(x, condition)
         
-        # Compute loss with all components
-        loss, loss_components = self.loss_fn(x, x_hat, z, z_mean, z_logvar)
+        # Compute loss with all components, including temporal consistency
+        loss, loss_components = self.loss_fn(
+            x, x_hat, z, z_mean, z_logvar, 
+            x_hat_prev=self.prev_reconstructed
+        )
+        
+        # Store current reconstruction for next temporal consistency calculation
+        self.prev_reconstructed = x_hat.detach()
         
         # Add VQ loss if present in processor
         if hasattr(self.processor, 'vq_loss'):
@@ -110,7 +124,7 @@ class AdaptiveWaveletNetwork(pl.LightningModule):
         # Forward pass
         x_hat, z, z_mean, z_logvar = self(x, condition)
         
-        # Compute loss
+        # Compute loss, no need for temporal consistency during validation
         loss, loss_components = self.loss_fn(x, x_hat, z, z_mean, z_logvar)
         
         # Add VQ loss if present
