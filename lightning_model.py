@@ -140,8 +140,16 @@ class WaveletAudioAE(pl.LightningModule):
         
         return loss
     
-    def _log_audio_and_visualizations(self, x, x_recon, wavelet_coeffs, wavelet_coeffs_recon):
-        """Log audio samples and visualizations to TensorBoard"""
+    def _log_audio_and_visualizations(self, x, x_recon, wavelet_coeffs, wavelet_coeffs_recon, window_boundaries=None):
+        """Log audio samples and enhanced visualizations to TensorBoard
+        
+        Includes:
+        - Original and reconstructed audio
+        - Overlapping waveform comparison
+        - Adaptive spectrogram scaling
+        - Wavelet coefficient visualization
+        - Window boundary markers (if available)
+        """
         # Get first sample from batch
         sample_idx = 0
         
@@ -160,84 +168,208 @@ class WaveletAudioAE(pl.LightningModule):
             sample_rate=self.config.sample_rate
         )
         
-        # Plot waveforms and wavelet coefficients
-        fig, axs = plt.subplots(2, 2, figsize=(10, 8))
+        # Convert tensors to numpy for visualization
+        x_np = x[sample_idx].cpu().numpy()
+        x_recon_np = x_recon[sample_idx].cpu().numpy()
         
-        # Original waveform
-        axs[0, 0].plot(x[sample_idx].cpu().numpy())
-        axs[0, 0].set_title('Original Waveform')
+        # 1. Enhanced Waveform Comparison
+        fig, ax = plt.subplots(figsize=(12, 4))
         
-        # Reconstructed waveform
-        axs[0, 1].plot(x_recon[sample_idx].cpu().numpy())
-        axs[0, 1].set_title('Reconstructed Waveform')
+        # Create time axis in seconds
+        t = np.arange(len(x_np)) / self.config.sample_rate
         
-        # Original wavelet coefficients (plot only a subset if too large)
-        coeffs = wavelet_coeffs[sample_idx].cpu().numpy()
-        plot_coeffs = coeffs[:min(1000, len(coeffs))]
-        axs[1, 0].plot(plot_coeffs)
-        axs[1, 0].set_title(f'Original Wavelet Coefficients (showing {len(plot_coeffs)} of {len(coeffs)})')
+        # Plot original waveform
+        ax.plot(t, x_np, alpha=0.7, label='Original', color='blue')
         
-        # Reconstructed wavelet coefficients (same subset)
-        recon_coeffs = wavelet_coeffs_recon[sample_idx].cpu().detach().numpy()
-        plot_recon_coeffs = recon_coeffs[:min(1000, len(recon_coeffs))]
-        axs[1, 1].plot(plot_recon_coeffs)
-        axs[1, 1].set_title(f'Reconstructed Wavelet Coefficients (showing {len(plot_recon_coeffs)} of {len(recon_coeffs)})')
+        # Plot reconstructed waveform
+        ax.plot(t, x_recon_np, alpha=0.7, label='Reconstructed', color='red')
         
-        plt.tight_layout()
+        # Plot error region
+        error = x_np - x_recon_np
+        ax.fill_between(t, error, -error, color='grey', alpha=0.3, label='Error')
+        
+        # Plot window boundaries if available
+        if window_boundaries is not None:
+            for boundary in window_boundaries:
+                boundary_time = boundary / self.config.sample_rate
+                ax.axvline(x=boundary_time, color='green', linestyle='--', alpha=0.5)
+        
+        ax.set_title('Waveform Comparison')
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Amplitude')
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+        
+        # Set reasonable y-limits
+        max_amp = max(np.max(np.abs(x_np)), np.max(np.abs(x_recon_np)))
+        ax.set_ylim(-max_amp * 1.1, max_amp * 1.1)
+        
+        # Add SNR value as text
+        snr_value = calculate_snr(
+            torch.tensor(x_np).unsqueeze(0), 
+            torch.tensor(x_recon_np).unsqueeze(0)
+        )[0].item()
+        ax.text(0.02, 0.92, f'SNR: {snr_value:.2f} dB', transform=ax.transAxes, 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+        
+        # Add zoom-in panel for detail
+        zoom_start = len(x_np) // 3
+        zoom_width = min(1000, len(x_np) // 10)
+        zoom_end = zoom_start + zoom_width
+        
+        # Create inset axis for zoom
+        axins = ax.inset_axes([0.05, 0.05, 0.3, 0.3])
+        axins.plot(t[zoom_start:zoom_end], x_np[zoom_start:zoom_end], 'b-')
+        axins.plot(t[zoom_start:zoom_end], x_recon_np[zoom_start:zoom_end], 'r-')
+        axins.set_title('Zoom', fontsize=8)
+        axins.grid(True, alpha=0.3)
+        
+        # Mark zoom region on main plot
+        ax.indicate_inset_zoom(axins, edgecolor="black")
         
         # Add figure to tensorboard
         self.logger.experiment.add_figure(
-            'waveform_comparison', 
+            'enhanced_waveform_comparison', 
             fig, 
             self.global_step
         )
         plt.close(fig)
         
-        # Plot spectrogram comparison periodically (less frequently to save resources)
-        if self.global_step % 100 == 0:
-            # Compute spectrograms using FFT
-            n_fft = min(1024, self.config.audio_length // 4)  # Adjust based on audio length
-            hop_length = n_fft // 4
-            
-            x_np = x[sample_idx].cpu().numpy()
-            x_recon_np = x_recon[sample_idx].cpu().numpy()
-            
-            # Compute spectrograms
-            spec_orig = compute_spectrogram(x_np, n_fft, hop_length)
-            spec_recon = compute_spectrogram(x_recon_np, n_fft, hop_length)
-            
-            # Convert to dB scale
-            eps = 1e-10
-            spec_orig_db = 20 * np.log10(spec_orig + eps)
-            spec_recon_db = 20 * np.log10(spec_recon + eps)
-            
-            # Clip values for better visualization
-            vmin = -80
-            vmax = 0
-            spec_orig_db = np.clip(spec_orig_db, vmin, vmax)
-            spec_recon_db = np.clip(spec_recon_db, vmin, vmax)
-            
-            # Plot spectrograms
-            fig, axs = plt.subplots(1, 2, figsize=(12, 5))
-            
-            axs[0].imshow(spec_orig_db, aspect='auto', origin='lower', cmap='viridis')
-            axs[0].set_title('Original Spectrogram')
-            axs[0].set_xlabel('Time Frames')
-            axs[0].set_ylabel('Frequency Bins')
-            
-            axs[1].imshow(spec_recon_db, aspect='auto', origin='lower', cmap='viridis')
-            axs[1].set_title('Reconstructed Spectrogram')
-            axs[1].set_xlabel('Time Frames')
-            
-            plt.tight_layout()
-            
-            # Add figure to tensorboard
-            self.logger.experiment.add_figure(
-                'spectrogram_comparison', 
-                fig, 
-                self.global_step
-            )
-            plt.close(fig)
+        # 2. Wavelet Coefficient Visualization
+        coeffs = wavelet_coeffs[sample_idx].cpu().numpy()
+        recon_coeffs = wavelet_coeffs_recon[sample_idx].cpu().detach().numpy()
+        
+        # Create comparison figure
+        fig, axs = plt.subplots(3, 1, figsize=(12, 8))
+        
+        # Determine reasonable viewing window for coefficients
+        # Show more coefficients for higher global steps as model improves
+        view_size = min(2000, len(coeffs))
+        
+        # Original coefficients
+        axs[0].plot(coeffs[:view_size], 'b-', label='Original')
+        axs[0].set_title('Original Wavelet Coefficients')
+        axs[0].grid(True, alpha=0.3)
+        
+        # Reconstructed coefficients
+        axs[1].plot(recon_coeffs[:view_size], 'r-', label='Reconstructed')
+        axs[1].set_title('Reconstructed Wavelet Coefficients')
+        axs[1].grid(True, alpha=0.3)
+        
+        # Coefficient difference
+        diff = coeffs[:view_size] - recon_coeffs[:view_size]
+        axs[2].plot(diff, 'g-', label='Difference')
+        axs[2].set_title('Coefficient Difference')
+        axs[2].set_xlabel('Coefficient Index')
+        axs[2].grid(True, alpha=0.3)
+        
+        # Set consistent y-limits for comparison
+        coeff_max = max(np.max(np.abs(coeffs[:view_size])), np.max(np.abs(recon_coeffs[:view_size])))
+        axs[0].set_ylim(-coeff_max * 1.1, coeff_max * 1.1)
+        axs[1].set_ylim(-coeff_max * 1.1, coeff_max * 1.1)
+        
+        # Set y-limit for difference plot
+        diff_max = np.max(np.abs(diff))
+        axs[2].set_ylim(-diff_max * 1.1, diff_max * 1.1)
+        
+        # Add coefficient statistics
+        mse = np.mean((diff) ** 2)
+        axs[2].text(0.02, 0.92, f'MSE: {mse:.6f}', transform=axs[2].transAxes, 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+        
+        # Add figure to tensorboard
+        self.logger.experiment.add_figure(
+            'enhanced_wavelet_comparison', 
+            fig, 
+            self.global_step
+        )
+        plt.close(fig)
+        
+        # 3. Enhanced Spectrogram Comparison with Adaptive Scaling
+        # Compute spectrograms using FFT
+        n_fft = min(1024, self.config.audio_length // 4)  # Adjust based on audio length
+        hop_length = n_fft // 4
+        
+        # Compute spectrograms
+        spec_orig = compute_spectrogram(x_np, n_fft, hop_length)
+        spec_recon = compute_spectrogram(x_recon_np, n_fft, hop_length)
+        
+        # Convert to dB scale with proper normalization
+        eps = 1e-10
+        spec_orig_db = 20 * np.log10(spec_orig + eps)
+        spec_recon_db = 20 * np.log10(spec_recon + eps)
+        
+        # Determine adaptive scaling based on data
+        # Use percentiles to avoid outliers affecting scale
+        all_values = np.concatenate([spec_orig_db.flatten(), spec_recon_db.flatten()])
+        vmin = np.percentile(all_values, 1)  # 1st percentile for minimum
+        vmax = np.percentile(all_values, 99)  # 99th percentile for maximum
+        
+        # Ensure a minimum dynamic range
+        if vmax - vmin < 60:
+            vmean = (vmax + vmin) / 2
+            vmin = vmean - 30
+            vmax = vmean + 30
+        
+        # Create frequency axis (Hz)
+        freqs = np.linspace(0, self.config.sample_rate/2, spec_orig.shape[0])
+        
+        # Create time axis (seconds)
+        spec_times = np.linspace(0, len(x_np)/self.config.sample_rate, spec_orig.shape[1])
+        
+        # Create spectrogram figure
+        fig, axs = plt.subplots(2, 1, figsize=(12, 8))
+        
+        # Plot original spectrogram
+        im0 = axs[0].imshow(spec_orig_db, aspect='auto', origin='lower', 
+                        cmap='viridis', vmin=vmin, vmax=vmax)
+        axs[0].set_title('Original Spectrogram')
+        axs[0].set_ylabel('Frequency (Hz)')
+        
+        # Add frequency axis labels (show subset for clarity)
+        n_freq_labels = 6
+        freq_indices = np.linspace(0, len(freqs)-1, n_freq_labels, dtype=int)
+        axs[0].set_yticks(freq_indices)
+        axs[0].set_yticklabels([f'{freqs[i]:.0f}' for i in freq_indices])
+        
+        # Plot reconstructed spectrogram
+        im1 = axs[1].imshow(spec_recon_db, aspect='auto', origin='lower', 
+                        cmap='viridis', vmin=vmin, vmax=vmax)
+        axs[1].set_title('Reconstructed Spectrogram')
+        axs[1].set_ylabel('Frequency (Hz)')
+        axs[1].set_xlabel('Time (s)')
+        
+        # Add frequency axis labels
+        axs[1].set_yticks(freq_indices)
+        axs[1].set_yticklabels([f'{freqs[i]:.0f}' for i in freq_indices])
+        
+        # Add time axis labels (to bottom plot only)
+        n_time_labels = 6
+        time_indices = np.linspace(0, len(spec_times)-1, n_time_labels, dtype=int)
+        axs[1].set_xticks(time_indices)
+        axs[1].set_xticklabels([f'{spec_times[i]:.2f}' for i in time_indices])
+        
+        # Add colorbar
+        #fig.colorbar(im0, ax=axs, orientation='vertical', label='Power (dB)')
+        
+        # Add window boundary markers if available
+        if window_boundaries is not None:
+            for boundary in window_boundaries:
+                # Convert sample positions to spectrogram frame indices
+                frame_idx = int(boundary / hop_length)
+                if frame_idx < spec_orig.shape[1]:
+                    axs[0].axvline(x=frame_idx, color='white', linestyle='--', alpha=0.5)
+                    axs[1].axvline(x=frame_idx, color='white', linestyle='--', alpha=0.5)
+        
+        plt.tight_layout()
+        
+        # Add figure to tensorboard
+        self.logger.experiment.add_figure(
+            'enhanced_spectrogram_comparison', 
+            fig, 
+            self.global_step
+        )
+        plt.close(fig)
     
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.config.learning_rate)
