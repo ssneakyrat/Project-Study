@@ -125,6 +125,7 @@ class WEMLightningModel(pl.LightningModule):
             
         # Select subset of samples to visualize
         n_samples = min(original.size(0), max_samples)
+        sample_rate = self.config.get('sample_rate', 16000)
         
         for i in range(n_samples):
             # Get sample data
@@ -135,7 +136,7 @@ class WEMLightningModel(pl.LightningModule):
             fig, ax = plt.subplots(figsize=(10, 4))
             
             # Plot both waveforms
-            time_axis = np.arange(len(orig)) / self.config.get('sample_rate', 16000)
+            time_axis = np.arange(len(orig)) / sample_rate
             ax.plot(time_axis, orig, alpha=0.7, label='Ground Truth', color='blue')
             ax.plot(time_axis, recon, alpha=0.7, label='Reconstructed', color='red')
             
@@ -156,6 +157,49 @@ class WEMLightningModel(pl.LightningModule):
             
             # Also log spectrograms
             self._log_spectrogram_comparison(orig, recon, i)
+            
+            # Add playable audio to TensorBoard
+            # Normalize audio to [-1, 1] for playback
+            if np.max(np.abs(orig)) > 0:
+                orig_normalized = orig / np.max(np.abs(orig))
+            else:
+                orig_normalized = orig
+                
+            if np.max(np.abs(recon)) > 0:
+                recon_normalized = recon / np.max(np.abs(recon))
+            else:
+                recon_normalized = recon
+            
+            # Log original audio
+            self.logger.experiment.add_audio(
+                f'audio_playback/original_{i}',
+                orig_normalized,
+                global_step=self.current_epoch,
+                sample_rate=sample_rate
+            )
+            
+            # Log reconstructed audio
+            self.logger.experiment.add_audio(
+                f'audio_playback/reconstructed_{i}',
+                recon_normalized,
+                global_step=self.current_epoch,
+                sample_rate=sample_rate
+            )
+            
+            # Log difference audio (error) - this is valuable for hearing artifacts
+            diff_audio = orig_normalized - recon_normalized
+            # Normalize difference for better audibility
+            if np.max(np.abs(diff_audio)) > 0:
+                diff_normalized = diff_audio / np.max(np.abs(diff_audio)) * 0.9  # Scale to avoid clipping
+            else:
+                diff_normalized = diff_audio
+                
+            self.logger.experiment.add_audio(
+                f'audio_playback/difference_{i}',
+                diff_normalized,
+                global_step=self.current_epoch,
+                sample_rate=sample_rate
+            )
     
     def _log_spectrogram_comparison(self, original, reconstructed, sample_idx):
         """
@@ -187,13 +231,36 @@ class WEMLightningModel(pl.LightningModule):
         axes[1].set_xlabel('Time frame')
         axes[1].set_ylabel('Frequency bin')
         
-        # No colorbar as requested
-        
         plt.tight_layout()
         
         # Log figure to TensorBoard
         self.logger.experiment.add_figure(
             f'spectrogram_comparison/sample_{sample_idx}', 
+            fig, 
+            global_step=self.current_epoch
+        )
+        plt.close(fig)
+        
+        # Also create and log the spectrogram difference (error visualization)
+        fig, ax = plt.subplots(figsize=(10, 4))
+        
+        # Compute error spectrogram (absolute difference)
+        D_error = np.abs(D_orig - D_recon)
+        
+        # Use a different colormap for error
+        im = ax.imshow(D_error, aspect='auto', origin='lower', cmap='hot')
+        ax.set_title('Spectrogram Error (absolute difference)')
+        ax.set_xlabel('Time frame')
+        ax.set_ylabel('Frequency bin')
+        
+        # Add colorbar
+        plt.colorbar(im, ax=ax)
+        
+        plt.tight_layout()
+        
+        # Log figure to TensorBoard
+        self.logger.experiment.add_figure(
+            f'spectrogram_error/sample_{sample_idx}', 
             fig, 
             global_step=self.current_epoch
         )
@@ -279,6 +346,49 @@ class WEMLightningModel(pl.LightningModule):
                 global_step=self.current_epoch
             )
             plt.close(fig)
+            
+            # Calculate and display accuracy metrics for this level
+            # Using coefficient of determination (R²) to quantify match quality
+            r2 = self._calculate_r2(orig_d, recon_d)
+            mse = np.mean((orig_d - recon_d)**2)
+            
+            # Log metrics
+            self.logger.experiment.add_scalar(
+                f'wavelet_metrics/detail_level_{level+1}_r2', 
+                r2,
+                global_step=self.current_epoch
+            )
+            
+            self.logger.experiment.add_scalar(
+                f'wavelet_metrics/detail_level_{level+1}_mse', 
+                mse,
+                global_step=self.current_epoch
+            )
+    
+    def _calculate_r2(self, y_true, y_pred):
+        """
+        Calculate coefficient of determination (R²)
+        
+        Args:
+            y_true: Ground truth values
+            y_pred: Predicted values
+            
+        Returns:
+            r2: R² score between 0 and 1
+        """
+        # Total sum of squares
+        ss_tot = np.sum((y_true - np.mean(y_true))**2)
+        # Residual sum of squares
+        ss_res = np.sum((y_true - y_pred)**2)
+        
+        # Handle edge case where all y_true values are identical
+        if ss_tot < 1e-10:
+            return 1.0 if ss_res < 1e-10 else 0.0
+            
+        # Calculate R²
+        r2 = 1 - (ss_res / ss_tot)
+        # Clip to [0,1] since we're using as accuracy percentage
+        return max(0, min(1, r2))
     
     def test_step(self, batch, batch_idx):
         x = batch

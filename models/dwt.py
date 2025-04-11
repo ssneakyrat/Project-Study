@@ -110,16 +110,15 @@ class DWT(torch.nn.Module):
             
             # Frequency-aware adaptive scaling factor (gentler on high frequencies)
             # Scale factor decreases for higher frequency bands (lower j value)
-            scale_factor = max(0.3, 1.0 - 0.15 * (self.level - j - 1))
+            # Mathematical scaling: higher frequencies (j=0) get lowest threshold (0.2)
+            # while lower frequencies get higher thresholds
+            scale_factor = max(0.2, 1.0 - 0.2 * (self.level - j - 1))
             
+            # Universal threshold T = λ * σ * sqrt(2 * log(N)) * scale_factor
             T = scale_factor * lambda_values[j] * std_d * torch.sqrt(torch.tensor(2.0 * np.log(N), device=d.device))
             
-            # Soft thresholding with proper broadcasting
+            # Soft thresholding with proper broadcasting: sign(x) * max(|x| - T, 0)
             d_abs = torch.abs(d)
-            # Initialize thresholded tensor with zeros
-            thresholded_d = torch.zeros_like(d)
-            
-            # Apply soft thresholding: sign(x) * max(|x| - threshold, 0)
             thresholded_d = torch.sign(d) * torch.clamp(d_abs - T, min=0)
             
             thresholded_coeffs['d'].append(thresholded_d)

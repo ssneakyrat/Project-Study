@@ -26,23 +26,49 @@ class ResidualBlock(nn.Module):
 
 class FrequencyAwareBlock(nn.Module):
     """
-    Specialized block for high-frequency detail processing
+    Enhanced specialized block for high-frequency detail processing
+    with multi-scale filtering and gating mechanism
     """
     def __init__(self, channels, kernel_size=3):
         super(FrequencyAwareBlock, self).__init__()
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=kernel_size//2, groups=2)
-        self.bn1 = nn.BatchNorm1d(channels)
-        self.lrelu1 = nn.LeakyReLU(0.1)  # Gentler activation for details
+        self.norm1 = nn.BatchNorm1d(channels)
+        
+        # Parallel processing paths with different kernel sizes for multi-scale awareness
+        self.conv_small = nn.Conv1d(channels, channels//2, kernel_size=3, padding=1, groups=2)
+        self.conv_med = nn.Conv1d(channels, channels//2, kernel_size=5, padding=2)
+        
+        self.norm2 = nn.BatchNorm1d(channels)
         self.conv2 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=kernel_size//2)
-        self.bn2 = nn.BatchNorm1d(channels)
-        self.lrelu2 = nn.LeakyReLU(0.1)
+        
+        # Gating mechanism for adaptive detail preservation
+        self.gate = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+        # Gentler activation for high-frequency details
+        self.lrelu = nn.LeakyReLU(0.1)
         
     def forward(self, x):
         residual = x
-        out = self.lrelu1(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = out + residual  # Skip connection
-        out = self.lrelu2(out)
+        
+        # Normalization
+        out = self.norm1(x)
+        
+        # Multi-scale parallel paths
+        out1 = self.conv_small(out)
+        out2 = self.conv_med(out)
+        out = torch.cat([out1, out2], dim=1)
+        
+        # Second conv layer
+        out = self.lrelu(self.norm2(out))
+        out = self.conv2(out)
+        
+        # Adaptive gating for selective detail preservation
+        gate = self.gate(residual)
+        out = gate * out + (1 - gate) * residual
+        
+        out = self.lrelu(out)
         return out
 
 class UnifiedEncoder(nn.Module):
@@ -109,22 +135,34 @@ class UnifiedEncoder(nn.Module):
                     )
                 )
         
-        # Progressive downsampling with preserved information
+        # Progressive downsampling with preserved information for high frequencies
         self.downsample = nn.ModuleList()
         for i in range(levels + 1):
             if i < 3:  # Reduced downsampling for high frequencies
                 # Less aggressive downsampling to preserve high-frequency details
-                factor = max(2, min(2**(levels-i-1), 4))
+                # Mathematical scaling: higher frequencies (j=0,1,2) get smaller downsampling factor
+                factor = max(2, min(2**(levels-i-2), 4))
+                
+                # Enhanced downsampling for high frequencies with extra processing
+                self.downsample.append(
+                    nn.Sequential(
+                        nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                        nn.BatchNorm1d(hidden_dim),
+                        nn.LeakyReLU(0.1),
+                        nn.Conv1d(hidden_dim, hidden_dim*2, kernel_size=factor+1, stride=factor, padding=1),
+                        nn.BatchNorm1d(hidden_dim*2),
+                        nn.LeakyReLU(0.1)
+                    )
+                )
             else:
                 factor = min(2**(levels-i), 8)  # Standard downsampling for others
-                
-            self.downsample.append(
-                nn.Sequential(
-                    nn.Conv1d(hidden_dim, hidden_dim*2, kernel_size=factor+1, stride=factor, padding=1),
-                    nn.BatchNorm1d(hidden_dim*2),
-                    nn.LeakyReLU(0.2)
+                self.downsample.append(
+                    nn.Sequential(
+                        nn.Conv1d(hidden_dim, hidden_dim*2, kernel_size=factor+1, stride=factor, padding=1),
+                        nn.BatchNorm1d(hidden_dim*2),
+                        nn.LeakyReLU(0.2)
+                    )
                 )
-            )
             
         # Fusion layer for combining all encoded features
         fusion_input_dim = hidden_dim*2 * (levels+1)
@@ -200,10 +238,9 @@ class UnifiedDecoder(nn.Module):
         for i in range(levels + 1):
             if i < 3:  # High-frequency branches get more capacity
                 # For high frequencies, we use a larger initial feature size (hidden_dim * 4)
-                # Note: The view operation reshapes to [B, hidden_dim, 4], so we need hidden_dim * 4
                 self.branch_projections.append(
                     nn.Sequential(
-                        nn.Linear(512, hidden_dim * 4),  # Changed from 6 to 4
+                        nn.Linear(512, hidden_dim * 4),
                         nn.LayerNorm(hidden_dim * 4),
                         nn.LeakyReLU(0.1)
                     )
@@ -221,7 +258,7 @@ class UnifiedDecoder(nn.Module):
         self.decoder_blocks = nn.ModuleList()
         for i in range(levels + 1):
             if i < 3:  # High-frequency specific processing
-                # Add extra capacity and specialized processing for high frequencies
+                # Enhanced processing for high frequencies with FrequencyAwareBlocks
                 self.decoder_blocks.append(
                     nn.Sequential(
                         nn.Conv1d(hidden_dim*2, hidden_dim, kernel_size=3, padding=1),
@@ -246,12 +283,12 @@ class UnifiedDecoder(nn.Module):
         # Final output layers with enhanced detail preservation
         self.output_layers = nn.ModuleList()
         for i in range(levels + 1):
-            if i < 3:  # High-frequency detail reconstruction
+            if i < 3:  # High-frequency detail reconstruction gets enhanced output
                 self.output_layers.append(
                     nn.Sequential(
                         nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
                         nn.LeakyReLU(0.1),
-                        nn.Conv1d(hidden_dim, 1, kernel_size=3, padding=1)
+                        nn.Conv1d(hidden_dim, 1, kernel_size=1)  # Point-wise for detail preservation
                     )
                 )
             else:
@@ -276,11 +313,10 @@ class UnifiedDecoder(nn.Module):
         
         # Reconstruct approximation coefficients
         a_shape = orig_shapes['a']
-        # All branches now use the same feature size (4)
         a_feat = self.branch_projections[0](h).view(batch_size, self.hidden_dim, 4)
         
         # Upsample to match encoder feature size then concatenate with encoder features
-        a_up = F.interpolate(a_feat, size=encoded_features[0].size(2))
+        a_up = F.interpolate(a_feat, size=encoded_features[0].size(2), mode='linear')
         a_concat = torch.cat([a_up, encoded_features[0]], dim=1)
         
         # Apply decoder blocks
@@ -288,18 +324,22 @@ class UnifiedDecoder(nn.Module):
         
         # Final layer and reshape to match original shape
         a_out = self.output_layers[0](a_dec)
-        a_out = F.interpolate(a_out, size=a_shape[1])
+        a_out = F.interpolate(a_out, size=a_shape[1], mode='linear')
         a_out = a_out.squeeze(1)
         
         # Reconstruct detail coefficients
         d_outs = []
         for j in range(self.levels):
             d_shape = orig_shapes['d'][j]
-            # All branches now use the same feature size (4)
             d_feat = self.branch_projections[j+1](h).view(batch_size, self.hidden_dim, 4)
             
-            # Upsample to match encoder feature size then concatenate with encoder features
-            d_up = F.interpolate(d_feat, size=encoded_features[j+1].size(2))
+            # Enhanced upsampling for high-frequency components
+            if j < 3:  # High-frequency specific handling
+                # Better interpolation mode for high-frequency components
+                d_up = F.interpolate(d_feat, size=encoded_features[j+1].size(2), mode='linear')
+            else:
+                d_up = F.interpolate(d_feat, size=encoded_features[j+1].size(2))
+                
             d_concat = torch.cat([d_up, encoded_features[j+1]], dim=1)
             
             # Apply decoder blocks
@@ -307,7 +347,13 @@ class UnifiedDecoder(nn.Module):
             
             # Final layer and reshape to match original shape
             d_out = self.output_layers[j+1](d_dec)
-            d_out = F.interpolate(d_out, size=d_shape[1])
+            
+            # Enhanced interpolation for high frequencies
+            if j < 3:
+                d_out = F.interpolate(d_out, size=d_shape[1], mode='linear')
+            else:
+                d_out = F.interpolate(d_out, size=d_shape[1])
+                
             d_out = d_out.squeeze(1)
             d_outs.append(d_out)
         
