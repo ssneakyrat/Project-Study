@@ -1,9 +1,14 @@
 import os
 import torch
-import h5py
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
+import warnings
+
+# Suppress specific HDF5 version warning
+warnings.filterwarnings("ignore", message="h5py is running against HDF5 .*")
+
+import h5py
 
 class AudioDataset(Dataset):
     def __init__(self, h5_file, sample_rate=16000, duration=2.0, transform=None):
