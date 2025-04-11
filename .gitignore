@@ -10,3 +10,4 @@ docs/
 *.png
 *.h5
 pretrained/
+outputs/
