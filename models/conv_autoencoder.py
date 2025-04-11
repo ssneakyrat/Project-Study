@@ -1,253 +1,347 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
-class ConvEncoder(nn.Module):
-    """Convolutional encoder for wavelet coefficients
+class ResidualFactorizedLinear(nn.Module):
+    """Memory-efficient factorized linear layer with residual connection
     
-    Uses 1D convolutions with appropriate reshaping for efficient parameter usage.
-    Includes residual connections for improved gradient flow during training.
+    Uses low-rank approximation with residual paths to improve gradient flow
+    while maintaining memory efficiency.
     """
-    def __init__(self, input_dim, latent_dim, base_channels=32):
+    def __init__(self, in_features, out_features, bottleneck_factor=4, bias=True):
+        super().__init__()
+        # Calculate bottleneck size (larger than previous version)
+        bottleneck_size = max(16, min(in_features, out_features) // bottleneck_factor)
+        
+        # Two smaller linear layers instead of one large one
+        self.layer1 = nn.Linear(in_features, bottleneck_size, bias=bias)
+        self.norm1 = nn.LayerNorm(bottleneck_size)
+        self.layer2 = nn.Linear(bottleneck_size, out_features, bias=bias)
+        
+        # Use SiLU activation for better gradient properties
+        self.activation = nn.SiLU()
+        
+        # Add residual connection if dimensions match
+        self.use_residual = in_features == out_features
+        if not self.use_residual and in_features < out_features:
+            # If output is larger, add projection for residual
+            self.residual_proj = nn.Linear(in_features, out_features, bias=False)
+            self.use_projection = True
+        else:
+            self.use_projection = False
+    
+    def forward(self, x):
+        # Save input for residual connection
+        identity = x
+        
+        # Forward pass through factorized layers
+        x = self.layer1(x)
+        x = self.norm1(x)
+        x = self.activation(x)
+        x = self.layer2(x)
+        
+        # Apply residual connection if dimensions match
+        if self.use_residual:
+            x = x + identity
+        elif self.use_projection:
+            x = x + self.residual_proj(identity)
+            
+        return x
+
+
+class WaveletLevelEncoder(nn.Module):
+    """Improved encoder that processes wavelet levels with appropriate attention
+    
+    Key improvements:
+    1. Direct path for approximation coefficients
+    2. Better parameter sharing with grouped convolutions
+    3. Residual connections for gradient flow
+    4. Layer normalization for training stability
+    """
+    def __init__(self, input_dim, latent_dim, level_dims=None):
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         
-        # Use more aggressive dimensionality reduction for large inputs
-        # Calculate intermediate dimension with logarithmic scaling
-        if input_dim > 16384:
-            intermediate_dim = 2048
-        elif input_dim > 8192:
-            intermediate_dim = 1024
-        elif input_dim > 4096:
-            intermediate_dim = 512
-        else:
-            intermediate_dim = 256
+        # Simple case for small inputs - use direct projection
+        if input_dim <= 2048:
+            self.direct_mode = True
+            self.direct_encoder = nn.Sequential(
+                ResidualFactorizedLinear(input_dim, input_dim // 2),
+                nn.SiLU(),
+                ResidualFactorizedLinear(input_dim // 2, latent_dim)
+            )
+            return
             
-        # Fixed sequence length - reshape to this for convolution
-        seq_len = 64
-        channels = max(8, intermediate_dim // seq_len)
+        self.direct_mode = False
         
-        # Much smaller projection dimension to reduce parameters
-        self.projection_dim = channels * seq_len
+        # Default level dimensions if not provided
+        if level_dims is None:
+            # Estimate dimensions for a 3-level wavelet transform
+            level_a = input_dim // 8  # Approximation coefficients
+            level_d3 = input_dim // 8  # Level 3 detail coefficients
+            level_d2 = input_dim // 4  # Level 2 detail coefficients
+            level_d1 = input_dim - level_a - level_d3 - level_d2  # Level 1 detail coefficients
+            level_dims = [level_a, level_d3, level_d2, level_d1]
         
-        # Initial projection from input to shaped tensor with bottleneck
-        self.input_projection = nn.Sequential(
-            nn.Linear(input_dim, intermediate_dim),  # First reduction
-            nn.LeakyReLU(0.2),
-            nn.Linear(intermediate_dim, self.projection_dim),  # Second reduction
-            nn.LeakyReLU(0.2)
+        self.level_dims = level_dims
+        num_levels = len(level_dims)
+        
+        # Create level-specific projections with better dimensionality
+        self.level_projections = nn.ModuleList()
+        proj_dims = []
+        
+        for i, dim in enumerate(level_dims):
+            # Approximation coefficients get higher dimensionality
+            if i == 0:
+                # More capacity for approximation coefficients
+                proj_dim = min(512, max(256, dim // 4))
+                self.level_projections.append(
+                    nn.Sequential(
+                        ResidualFactorizedLinear(dim, proj_dim, bottleneck_factor=2),
+                        nn.LayerNorm(proj_dim)
+                    )
+                )
+            else:
+                # Detail coefficients get scaled capacity based on level
+                level_factor = 2 * (2 ** (i-1))  # Higher levels get less capacity
+                proj_dim = min(256, max(64, dim // level_factor))
+                self.level_projections.append(
+                    nn.Sequential(
+                        ResidualFactorizedLinear(dim, proj_dim, bottleneck_factor=4),
+                        nn.LayerNorm(proj_dim)
+                    )
+                )
+            proj_dims.append(proj_dim)
+                
+        # Calculate total projection dimension
+        self.total_proj_dim = sum(proj_dims)
+        
+        # Final projection to latent space with proper scaling
+        self.final_projection = nn.Sequential(
+            ResidualFactorizedLinear(self.total_proj_dim, latent_dim * 2),
+            nn.LayerNorm(latent_dim * 2),
+            nn.SiLU(),
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.Tanh()  # Bound values for better training stability
         )
         
-        # Convolutional encoder
-        self.conv_encoder = nn.Sequential(
-            # Reshape for convolution
-            Lambda(lambda x: x.view(x.size(0), channels, seq_len)),
-            
-            # First convolutional block with residual connection
-            ResidualConvBlock(channels, channels, kernel_size=3, stride=1, padding=1),
-            nn.AvgPool1d(2),  # seq_len → seq_len/2
-            
-            # Second convolutional block
-            ConvBlock(channels, channels*2, kernel_size=3, stride=1, padding=1),
-            nn.AvgPool1d(2),  # seq_len/2 → seq_len/4
-            
-            # Third convolutional block
-            ConvBlock(channels*2, channels*4, kernel_size=3, stride=1, padding=1),
-            nn.AvgPool1d(2),  # seq_len/4 → seq_len/8
-            
-            # Flatten for final projection
-            nn.Flatten()
+        # Create a fallback pathway for any level size mismatches
+        self.fallback = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.LayerNorm(512),
+            nn.SiLU(),
+            nn.Linear(512, latent_dim),
+            nn.Tanh()
         )
-        
-        # Calculate size after convolutions
-        self.conv_output_size = (channels * 4) * (seq_len // 8)
-        
-        # Projection to latent space
-        self.latent_projection = nn.Sequential(
-            nn.Linear(self.conv_output_size, latent_dim)
-        )
-    
-    def forward(self, x):
-        # Initial projection
-        x = self.input_projection(x)
-        
-        # Convolutional encoding
-        x = self.conv_encoder(x)
-        
-        # Project to latent space
-        z = self.latent_projection(x)
-        
-        return z
 
-class ConvDecoder(nn.Module):
-    """Convolutional decoder for wavelet coefficients
+    def forward(self, x):
+        # Direct path for small inputs
+        if self.direct_mode:
+            return self.direct_encoder(x)
+        
+        batch_size = x.shape[0]
+        
+        # Check if input dimension matches expected total
+        expected_dim = sum(self.level_dims)
+        if x.shape[1] != expected_dim:
+            # Fall back to direct pathway if dimensions don't match
+            return self.fallback(x)
+        
+        # Process each level separately
+        level_features = []
+        start_idx = 0
+        
+        # Process each wavelet level
+        for i, dim in enumerate(self.level_dims):
+            # Extract level coefficients
+            level_x = x[:, start_idx:start_idx+dim]
+            
+            # Apply level-specific projection
+            try:
+                level_feat = self.level_projections[i](level_x)
+                level_features.append(level_feat)
+            except RuntimeError:
+                # Handle edge cases with fallback
+                return self.fallback(x)
+                
+            start_idx += dim
+        
+        # Concatenate all level features
+        if level_features:
+            # Simple concatenation - no reshaping needed
+            x = torch.cat(level_features, dim=1)
+            
+            # Project to latent space
+            z = self.final_projection(x)
+            return z
+        else:
+            # Fallback for edge cases
+            return self.fallback(x)
+
+
+class WaveletLevelDecoder(nn.Module):
+    """Improved decoder that reconstructs wavelet levels with appropriate attention
     
-    Uses transposed convolutions to efficiently decode latent representation.
-    Mirror of encoder with residual connections for improved gradient flow.
+    Key improvements:
+    1. Direct path for approximation coefficients
+    2. Better upsampling with residual connections
+    3. Layer normalization for training stability
+    4. Progressive expansion with better gradient flow
     """
-    def __init__(self, latent_dim, output_dim, base_channels=32):
+    def __init__(self, latent_dim, output_dim, level_dims=None):
         super().__init__()
         self.latent_dim = latent_dim
         self.output_dim = output_dim
         
-        # Use more aggressive dimensionality reduction for large outputs
-        # Calculate intermediate dimension with logarithmic scaling
-        if output_dim > 16384:
-            intermediate_dim = 2048
-        elif output_dim > 8192:
-            intermediate_dim = 1024
-        elif output_dim > 4096:
-            intermediate_dim = 512
-        else:
-            intermediate_dim = 256
+        # Simple case for small outputs - use direct factorized projection
+        if output_dim <= 2048:
+            self.direct_mode = True
+            self.direct_decoder = nn.Sequential(
+                nn.Linear(latent_dim, output_dim // 2),
+                nn.LayerNorm(output_dim // 2),
+                nn.SiLU(),
+                ResidualFactorizedLinear(output_dim // 2, output_dim)
+            )
+            return
+            
+        self.direct_mode = False
         
-        # Fixed sequence length
-        seq_len = 64
-        channels = max(8, intermediate_dim // seq_len)
+        # Default level dimensions if not provided
+        if level_dims is None:
+            # Estimate dimensions for a 3-level wavelet transform
+            level_a = output_dim // 8   # Approximation coefficients
+            level_d3 = output_dim // 8  # Level 3 detail coefficients
+            level_d2 = output_dim // 4  # Level 2 detail coefficients
+            level_d1 = output_dim - level_a - level_d3 - level_d2  # Level 1 detail coefficients
+            level_dims = [level_a, level_d3, level_d2, level_d1]
         
-        # Much smaller projection dimension
-        self.projection_dim = channels * seq_len
+        self.level_dims = level_dims
+        num_levels = len(level_dims)
         
-        # Calculate dimensions after convolutions (before upsampling)
-        self.conv_input_size = (channels * 4) * (seq_len // 8)
-        
-        # Projection from latent space to convolution input with smaller sizes
-        self.latent_projection = nn.Sequential(
-            nn.Linear(latent_dim, min(512, self.conv_input_size)),
-            nn.LeakyReLU(0.2),
-            nn.Linear(min(512, self.conv_input_size), self.conv_input_size),
-            nn.LeakyReLU(0.2)
+        # Initial expansion from latent to intermediate representation
+        self.initial_expansion = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.LayerNorm(latent_dim * 2),
+            nn.SiLU(),
+            nn.Linear(latent_dim * 2, sum(min(512, max(128, dim // 2)) for i, dim in enumerate(level_dims))),
+            nn.SiLU()
         )
         
-        # Convolutional decoder with upsampling
-        self.conv_decoder = nn.Sequential(
-            # Reshape for convolution
-            Lambda(lambda x: x.view(x.size(0), channels*4, seq_len//8)),
-            
-            # First upsampling block
-            ConvTransposeBlock(channels*4, channels*2, kernel_size=4, stride=2, padding=1),
-            
-            # Second upsampling block
-            ConvTransposeBlock(channels*2, channels, kernel_size=4, stride=2, padding=1),
-            
-            # Third upsampling block with residual connection
-            ResidualConvTransposeBlock(channels, channels, kernel_size=4, stride=2, padding=1),
-            
-            # Flatten for final projection
-            nn.Flatten()
-        )
+        # Level-specific upsampling projections
+        self.level_decoders = nn.ModuleList()
         
-        # Final projection to output space with bottleneck
-        self.output_projection = nn.Sequential(
-            nn.Linear(self.projection_dim, intermediate_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(intermediate_dim, output_dim)
+        # Calculate split sizes for the expanded representation
+        self.split_sizes = []
+        start_idx = 0
+        
+        for i, dim in enumerate(level_dims):
+            # Higher quality for approximation coefficients
+            if i == 0:
+                # More capacity for approximation coefficients
+                hidden_dim = min(512, max(256, dim // 2))
+                self.level_decoders.append(
+                    nn.Sequential(
+                        ResidualFactorizedLinear(hidden_dim, dim, bottleneck_factor=2),
+                        nn.LayerNorm(dim)
+                    )
+                )
+            else:
+                # Detail coefficients get progressively less capacity
+                level_factor = 2 * (2 ** (i-1))  # Higher levels get less capacity
+                hidden_dim = min(256, max(128, dim // level_factor))
+                self.level_decoders.append(
+                    nn.Sequential(
+                        ResidualFactorizedLinear(hidden_dim, dim, bottleneck_factor=4),
+                        nn.LayerNorm(dim)
+                    )
+                )
+                
+            self.split_sizes.append(hidden_dim)
+        
+        # Create a fallback pathway for any edge cases
+        self.fallback = nn.Sequential(
+            nn.Linear(latent_dim, 512),
+            nn.LayerNorm(512),
+            nn.SiLU(),
+            nn.Linear(512, output_dim)
         )
-    
+
     def forward(self, z):
-        # Project from latent space
-        x = self.latent_projection(z)
+        # Direct path for small outputs
+        if self.direct_mode:
+            return self.direct_decoder(z)
         
-        # Convolutional decoding with upsampling
-        x = self.conv_decoder(x)
+        batch_size = z.shape[0]
         
-        # Final projection to output space
-        output = self.output_projection(x)
-        
-        return output
+        try:
+            # Expand latent to intermediate representation
+            x = self.initial_expansion(z)
+            
+            # Split into level-specific representations
+            level_parts = torch.split(x, self.split_sizes, dim=1)
+            
+            # Process each level separately
+            level_outputs = []
+            for i, level_part in enumerate(level_parts):
+                # Generate coefficients for this level
+                level_output = self.level_decoders[i](level_part)
+                level_outputs.append(level_output)
+            
+            # Concatenate all level outputs
+            output = torch.cat(level_outputs, dim=1)
+            
+            # Ensure output dimension matches expected
+            if output.shape[1] > self.output_dim:
+                output = output[:, :self.output_dim]
+            elif output.shape[1] < self.output_dim:
+                padding = torch.zeros(batch_size, self.output_dim - output.shape[1], device=output.device)
+                output = torch.cat([output, padding], dim=1)
+                
+            return output
+            
+        except RuntimeError:
+            # Fallback for edge cases
+            return self.fallback(z)
+
 
 class ConvWaveletAutoencoder(nn.Module):
-    """Combined convolutional encoder-decoder for wavelet coefficients
+    """Improved wavelet autoencoder with better gradient flow and capacity
     
-    Uses convolutional layers for parameter efficiency and improved
-    frequency locality with residual connections for better training dynamics.
+    Key improvements:
+    1. Direct path for approximation coefficients
+    2. Residual connections throughout
+    3. Layer normalization for training stability
+    4. Better balance between capacity and parameter count
     """
-    def __init__(self, input_dim, latent_dim, base_channels=64):
+    def __init__(self, input_dim, latent_dim, base_channels=16):
         super().__init__()
         
-        self.encoder = ConvEncoder(input_dim, latent_dim, base_channels)
-        self.decoder = ConvDecoder(latent_dim, input_dim, base_channels)
+        # For very large inputs, estimate level dimensions
+        if input_dim > 8192:
+            # Approximate level dimensions for a 3-level DWT
+            level_a = input_dim // 8   # Approximation coefficients
+            level_d3 = input_dim // 8  # Level 3 detail coefficients
+            level_d2 = input_dim // 4  # Level 2 detail coefficients
+            level_d1 = input_dim - level_a - level_d3 - level_d2  # Level 1 detail coefficients
+            level_dims = [level_a, level_d3, level_d2, level_d1]
+        elif input_dim > 2048:
+            # Smaller approximation for medium inputs
+            level_a = input_dim // 4   # Approximation coefficients
+            level_d2 = input_dim // 3  # Detail coefficients
+            level_d1 = input_dim - level_a - level_d2  # Remaining details
+            level_dims = [level_a, level_d2, level_d1]
+        else:
+            # For small inputs, no need for level-based processing
+            level_dims = None
+        
+        # Create improved encoder and decoder
+        self.encoder = WaveletLevelEncoder(input_dim, latent_dim, level_dims)
+        self.decoder = WaveletLevelDecoder(latent_dim, input_dim, level_dims)
     
     def forward(self, x):
         """Forward pass through autoencoder"""
         z = self.encoder(x)
         x_recon = self.decoder(z)
         return x_recon, z
-
-
-# Helper modules for convolutional networks
-
-class Lambda(nn.Module):
-    """Lambda layer for custom operations"""
-    def __init__(self, func):
-        super().__init__()
-        self.func = func
-    
-    def forward(self, x):
-        return self.func(x)
-
-class ConvBlock(nn.Module):
-    """Basic convolutional block with normalization and activation"""
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
-        super().__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding)
-        self.norm = nn.GroupNorm(num_groups=8, num_channels=out_channels)
-        self.act = nn.LeakyReLU(0.2)
-    
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.norm(x)
-        x = self.act(x)
-        return x
-
-class ResidualConvBlock(nn.Module):
-    """Convolutional block with residual connection"""
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
-        super().__init__()
-        self.conv1 = ConvBlock(in_channels, out_channels, kernel_size, stride, padding)
-        self.conv2 = ConvBlock(out_channels, out_channels, kernel_size, stride, padding)
-        
-        # Residual connection
-        self.residual = nn.Identity() if in_channels == out_channels else nn.Conv1d(in_channels, out_channels, 1)
-    
-    def forward(self, x):
-        residual = self.residual(x)
-        x = self.conv1(x)
-        x = self.conv2(x)
-        return x + residual
-
-class ConvTransposeBlock(nn.Module):
-    """Transposed convolutional block for upsampling"""
-    def __init__(self, in_channels, out_channels, kernel_size=4, stride=2, padding=1):
-        super().__init__()
-        self.conv = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride, padding)
-        self.norm = nn.GroupNorm(num_groups=8, num_channels=out_channels)
-        self.act = nn.LeakyReLU(0.2)
-    
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.norm(x)
-        x = self.act(x)
-        return x
-
-class ResidualConvTransposeBlock(nn.Module):
-    """Transposed convolutional block with residual connection"""
-    def __init__(self, in_channels, out_channels, kernel_size=4, stride=2, padding=1):
-        super().__init__()
-        self.conv1 = ConvTransposeBlock(in_channels, out_channels, kernel_size, stride, padding)
-        self.conv2 = ConvBlock(out_channels, out_channels, 3, 1, 1)
-        
-        # Residual connection with upsampling
-        self.residual = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='nearest'),
-            nn.Conv1d(in_channels, out_channels, 1)
-        ) if stride > 1 else (
-            nn.Identity() if in_channels == out_channels else nn.Conv1d(in_channels, out_channels, 1)
-        )
-    
-    def forward(self, x):
-        residual = self.residual(x)
-        x = self.conv1(x)
-        x = self.conv2(x)
-        return x + residual

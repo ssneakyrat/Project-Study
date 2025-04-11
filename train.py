@@ -40,7 +40,7 @@ def main():
     model = WaveletAudioAE(config)
     
     # Initialize logger
-    logger = TensorBoardLogger('logs', name='wavelet_ae_optimized')
+    logger = TensorBoardLogger('logs', name='wavelet_ae')
     
     # Initialize callbacks
     checkpoint_callback = ModelCheckpoint(
@@ -86,12 +86,12 @@ def main():
     print_gpu_stats()
     
     # Save model and configuration
-    model_path = os.path.join(args.output_dir, 'wavelet_ae_optimized_model.pt')
+    model_path = os.path.join(args.output_dir, 'wavelet_ae_model.pt')
     torch.save(model.state_dict(), model_path)
     print(f"Model saved to {model_path}")
     
     # Save config
-    config_path = os.path.join(args.output_dir, 'wavelet_ae_optimized_config.yaml')
+    config_path = os.path.join(args.output_dir, 'wavelet_ae_config.yaml')
     save_config(config, config_path)
     print(f"Configuration saved to {config_path}")
     
