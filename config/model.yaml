@@ -16,8 +16,10 @@ wavelet: 'db4'
 dwt_level: 3
 
 # Model architecture
-hidden_dims: [128, 64, 32]
+autoencoder_type: 'standard'  # Options: 'standard', 'convolutional', 'conv'
+hidden_dims: [128, 64, 32]    # Used by standard autoencoder
 latent_dim: 16
+base_channels: 32             # Used by convolutional autoencoder
 
 # Data storage
 data_dir: './data/audio'

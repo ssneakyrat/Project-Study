@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from models.wavelet import WaveletTransformOptimized
 from models.level_processor import WaveletLevelProcessor
-#from models.conv_autoencoder import ConvWaveletAutoencoder
+from models.conv_autoencoder import ConvWaveletAutoencoder  # Uncommented for model switching
 from models.autoencoder import WaveletAutoencoder
 from utils.utils import calculate_snr, compute_spectrogram
 
@@ -52,12 +52,27 @@ class WaveletAudioAE(pl.LightningModule):
         # Create simplified level processor (focuses on approximation coefficients only)
         self.level_processor = WaveletLevelProcessor(level_dims)
         
-        # Create lightweight autoencoder (prioritizes approximation coefficients)
-        self.autoencoder = WaveletAutoencoder(
-            input_dim=self.input_dim,
-            latent_dim=config.latent_dim,
-            base_channels=32  # Reduced from 64 to save memory
-        )
+        # Determine autoencoder type (default to standard if not specified)
+        autoencoder_type = getattr(config, 'autoencoder_type', 'standard')
+        
+        # Create the appropriate autoencoder model based on configuration
+        if autoencoder_type == 'convolutional' or autoencoder_type == 'conv':
+            print(f"Using ConvWaveletAutoencoder for model")
+            base_channels = getattr(config, 'base_channels', 32)
+            self.autoencoder = ConvWaveletAutoencoder(
+                input_dim=self.input_dim,
+                latent_dim=config.latent_dim,
+                base_channels=base_channels
+            )
+        else:  # 'standard' or any other value defaults to standard autoencoder
+            print(f"Using WaveletAutoencoder for model")
+            # Get hidden dimensions from config or use default
+            hidden_dims = getattr(config, 'hidden_dims', [128, 64, 32])
+            self.autoencoder = WaveletAutoencoder(
+                input_dim=self.input_dim,
+                hidden_dims=hidden_dims,
+                latent_dim=config.latent_dim
+            )
         
         # Calculate compression ratio
         self.compression_ratio = config.audio_length / config.latent_dim
