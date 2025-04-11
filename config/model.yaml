@@ -1,0 +1,37 @@
+# Model hyperparameters
+model:
+  wavelet: 'db4'     # Wavelet type
+  levels: 6          # Number of wavelet decomposition levels
+  hidden_dim: 128    # Hidden dimension for encoder/decoder
+  latent_dim: 256    # Latent dimension
+  
+# Training hyperparameters
+training:
+  batch_size: 32
+  learning_rate: 0.001
+  weight_decay: 0.00005
+  max_epochs: 100
+  early_stopping_patience: 10
+  gradient_clip_val: 1.0
+  
+# Loss hyperparameters
+loss:
+  wavelet_loss_weight: 0.7
+  time_loss_weight: 0.3
+  loss_alpha: 0.5    # Weight increment factor for multi-scale loss
+  
+# Data hyperparameters
+data:
+  sample_rate: 16000
+  duration: 2.0      # Duration in seconds
+  num_workers: 4
+  
+# Mixed precision training
+precision: 16        # Use FP16 for faster training
+  
+# Logging
+logging:
+  log_every_n_steps: 50
+
+# Seed for reproducibility
+seed: 42
