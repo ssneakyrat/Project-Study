@@ -104,15 +104,21 @@ class DWT(torch.nn.Module):
         
         # Apply thresholding to detail coefficients
         for j, d in enumerate(coeffs['d']):
+            batch_size = d.shape[0]
             N = d.shape[1]
             std_d = torch.std(d, dim=1, keepdim=True)
             T = lambda_values[j] * std_d * torch.sqrt(torch.tensor(2.0 * np.log(N), device=d.device))
             
-            # Soft thresholding
+            # Soft thresholding with proper broadcasting
             d_abs = torch.abs(d)
+            # Create a mask that properly broadcasts across the batch dimension
             mask = d_abs > T
+            
+            # Initialize thresholded tensor with zeros
             thresholded_d = torch.zeros_like(d)
-            thresholded_d[mask] = torch.sign(d[mask]) * (d_abs[mask] - T[mask[0]])
+            
+            # Apply soft thresholding: sign(x) * max(|x| - threshold, 0)
+            thresholded_d = torch.sign(d) * torch.clamp(d_abs - T, min=0)
             
             thresholded_coeffs['d'].append(thresholded_d)
             
