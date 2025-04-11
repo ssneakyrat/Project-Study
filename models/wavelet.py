@@ -3,20 +3,21 @@ import numpy as np
 import pywt
 
 class WaveletTransformOptimized:
-    """Enhanced wavelet transform module with coefficient pruning
+    """Efficient wavelet transform with aggressive coefficient pruning and approximation-focused processing
     
-    Implements Discrete Wavelet Transform (DWT) and its inverse (IDWT) with:
-    - Adaptive coefficient thresholding (pruning)
-    - Level-aware processing
-    - Preservation of level structure for more efficient compression
+    Key improvements:
+    1. More aggressive pruning of detail coefficients
+    2. Preservation of approximation coefficients
+    3. Optimized batch processing to reduce CPU-GPU transfers
     """
-    def __init__(self, wavelet='db4', level=3, threshold_factor=2.0):
+    def __init__(self, wavelet='db4', level=3, threshold_factor=3.0):
         """Initialize wavelet transform with specified wavelet and decomposition level
         
         Args:
             wavelet (str): Wavelet family to use (e.g., 'db4', 'haar')
             level (int): Decomposition level
             threshold_factor (float): Controls sparsity via T_j = threshold_factor·σ·√(2·log N_j)
+                                      Higher values → more sparsity → faster training
         """
         self.wavelet = wavelet
         self.level = level
@@ -32,14 +33,7 @@ class WaveletTransformOptimized:
         pywt.Wavelet(wavelet)
     
     def _calculate_expected_shapes(self, length):
-        """Calculate expected coefficient shapes for a given input length
-        
-        For a signal of length N with decomposition level L:
-        - Approx coefficients at level L: N_L ≈ N/2^L
-        - Detail coefficients at level j: N_j ≈ N/2^j
-        
-        Returns a tuple of: (total_coeffs, slice_indices, level_dims)
-        """
+        """Calculate expected coefficient shapes for a given input length"""
         # Create a dummy signal to calculate expected shapes
         dummy = np.zeros(length)
         
@@ -61,23 +55,18 @@ class WaveletTransformOptimized:
             
         return total_coeffs, slice_indices, level_dims
     
-    def _apply_coefficient_pruning(self, coeffs_tensor, training=True):
-        """Apply adaptive thresholding to wavelet coefficients
+    def _apply_aggressive_pruning(self, coeffs_tensor, training=True):
+        """Apply adaptive thresholding focused on detail coefficients
         
-        Implementation of the wavelet shrinkage denoising method:
-        1. Estimate noise level using median absolute deviation
-        2. Calculate threshold using the universal threshold formula
-        3. Apply soft thresholding to coefficients
+        This preserves approximation coefficients (most important) while
+        aggressively pruning detail coefficients (less perceptually important).
         
-        Args:
-            coeffs_tensor: Wavelet coefficients [batch_size, total_coeffs]
-            training: If True, apply soft thresholding; if False, apply hard thresholding
-            
-        Returns:
-            Pruned coefficients [batch_size, total_coeffs]
+        Mathematical basis: Universal shrinkage threshold
+        T_j = threshold_factor * σ * sqrt(2 * log(N_j))
+        with level-dependent scaling for perceptual importance.
         """
         if not training:
-            # During inference, use hard thresholding for better quality
+            # During inference, preserve more coefficients for quality
             return coeffs_tensor
         
         batch_size = coeffs_tensor.shape[0]
@@ -94,21 +83,23 @@ class WaveletTransformOptimized:
                 pruned_coeffs[:, start_idx:end_idx] = level_coeffs
                 continue
             
-            # For detail coefficients, apply thresholding
+            # For detail coefficients, apply more aggressive thresholding for higher levels
+            # Higher level detail coefficients (higher frequency) typically contribute less
+            # to perceptual quality, so we apply stronger pruning
+            
             # Estimate noise level using median absolute deviation
             mad = torch.median(torch.abs(level_coeffs - torch.median(level_coeffs))) / 0.6745
             
-            # Universal threshold formula: T = threshold_factor * σ * sqrt(2 * log(N))
-            # Higher levels get progressively stronger thresholding
-            level_factor = self.threshold_factor * (1 + (i-1) * 0.2)  # Increase factor for higher levels
+            # Universal threshold with level-dependent scaling:
+            # Higher i → higher frequency → more aggressive pruning
+            level_factor = self.threshold_factor * (1.0 + i * 0.5)  # Increase by 50% per level
             N = end_idx - start_idx
             threshold = level_factor * mad * torch.sqrt(2.0 * torch.log(torch.tensor(N, dtype=torch.float, device=device)))
             
-            # Apply soft thresholding: sign(x) * max(|x| - threshold, 0)
-            # This keeps the sign but reduces the magnitude
-            signs = torch.sign(level_coeffs)
-            magnitudes = torch.abs(level_coeffs) - threshold
-            pruned_level_coeffs = signs * torch.clamp(magnitudes, min=0.0)
+            # Hard thresholding for faster training and better sparsity
+            magnitude = torch.abs(level_coeffs)
+            mask = magnitude > threshold
+            pruned_level_coeffs = level_coeffs * mask.float()
             
             # Store pruned coefficients
             pruned_coeffs[:, start_idx:end_idx] = pruned_level_coeffs
@@ -116,7 +107,7 @@ class WaveletTransformOptimized:
         return pruned_coeffs
     
     def forward(self, x, training=True):
-        """Apply DWT to batch of signals and return flattened coefficients with pruning
+        """Apply DWT with batch processing to improve efficiency
         
         Args:
             x: Input audio tensor [batch_size, audio_length]
@@ -133,100 +124,84 @@ class WaveletTransformOptimized:
             self.expected_length = x.shape[1]
             self.total_coeffs, self.slice_indices, self.level_dims = self._calculate_expected_shapes(x.shape[1])
             
-        # Pre-allocate output tensor for efficiency
+        # Process in small batches to reduce memory pressure
+        max_batch = 16
         coeffs_tensor = torch.zeros((batch_size, self.total_coeffs), dtype=torch.float32, device='cpu')
         
-        # Process each sample in the batch
-        for i in range(batch_size):
-            # Move to CPU for PyWavelets (which doesn't support GPU)
-            signal = x[i].cpu().numpy()
+        # Process in smaller batches to reduce memory transfers
+        for i in range(0, batch_size, max_batch):
+            end_idx = min(i + max_batch, batch_size)
+            sub_batch = x[i:end_idx]
             
-            # Apply DWT
-            coeffs = pywt.wavedec(signal, self.wavelet, level=self.level)
+            # Move entire sub-batch to CPU at once
+            sub_batch_cpu = sub_batch.cpu().numpy()
             
-            # Concatenate coefficients directly into pre-allocated tensor
-            start_idx = 0
-            for c in coeffs:
-                end_idx = start_idx + len(c)
-                coeffs_tensor[i, start_idx:end_idx] = torch.from_numpy(c.astype(np.float32))
-                start_idx = end_idx
+            # Process each sample in the sub-batch
+            for j in range(end_idx - i):
+                # Apply DWT
+                coeffs = pywt.wavedec(sub_batch_cpu[j], self.wavelet, level=self.level)
+                
+                # Concatenate coefficients
+                start_idx = 0
+                for c in coeffs:
+                    end_idx_c = start_idx + len(c)
+                    coeffs_tensor[i+j, start_idx:end_idx_c] = torch.from_numpy(c.astype(np.float32))
+                    start_idx = end_idx_c
         
-        # Move back to original device
+        # Move back to original device (single transfer)
         coeffs_tensor = coeffs_tensor.to(device)
         
         # Apply coefficient pruning during training
-        pruned_coeffs = self._apply_coefficient_pruning(coeffs_tensor, training)
+        pruned_coeffs = self._apply_aggressive_pruning(coeffs_tensor, training)
         
         return pruned_coeffs
     
     def inverse(self, coeffs_tensor):
-        """Reconstruct signals from flattened wavelet coefficients
-        
-        IDWT: x(t) = Σ_{j,k} W_ψ[j,k]·ψ_{j,k}(t)
-        
-        Args:
-            coeffs_tensor: Flattened coefficients [batch_size, total_coeffs]
-            
-        Returns:
-            Reconstructed audio [batch_size, audio_length]
-        """
+        """Reconstruct signals from wavelet coefficients with optimized batch processing"""
         batch_size = coeffs_tensor.shape[0]
         device = coeffs_tensor.device
+        
+        # Process in smaller batches to reduce memory pressure
+        max_batch = 16
+        output_length = self.expected_length
+        reconstructed = torch.zeros((batch_size, output_length), dtype=torch.float32, device=device)
         
         # Move to CPU for processing with PyWavelets
         coeffs_tensor_cpu = coeffs_tensor.cpu()
         
-        # Use a more efficient approach - pre-allocate output numpy array
-        # Estimate the maximum possible length based on expected_length
-        max_possible_length = int(self.expected_length * 1.1)  # Add 10% to account for boundary effects
-        reconstructed = np.zeros((batch_size, max_possible_length), dtype=np.float32)
-        actual_lengths = []
-        
-        for i in range(batch_size):
-            # Extract coefficients for this sample
-            coeffs = []
-            for start_idx, end_idx, shape in self.slice_indices:
-                coeff = coeffs_tensor_cpu[i, start_idx:end_idx].detach().numpy().reshape(shape)
-                coeffs.append(coeff)
+        for i in range(0, batch_size, max_batch):
+            end_idx = min(i + max_batch, batch_size)
             
-            # Reconstruct signal
-            rec_signal = pywt.waverec(coeffs, self.wavelet)
-            actual_lengths.append(len(rec_signal))
-            
-            # Store in pre-allocated array, handling potential length differences
-            reconstructed[i, :len(rec_signal)] = rec_signal
+            # Process each sample in the sub-batch
+            for j in range(end_idx - i):
+                # Extract coefficients for this sample
+                coeffs = []
+                for start_idx, end_idx_c, shape in self.slice_indices:
+                    coeff = coeffs_tensor_cpu[i+j, start_idx:end_idx_c].detach().numpy().reshape(shape)
+                    coeffs.append(coeff)
+                
+                # Reconstruct signal
+                rec_signal = pywt.waverec(coeffs, self.wavelet)
+                
+                # Trim to expected length
+                if len(rec_signal) >= output_length:
+                    rec_signal = rec_signal[:output_length]
+                else:
+                    # Pad if too short
+                    rec_signal = np.pad(rec_signal, (0, output_length - len(rec_signal)))
+                
+                # Copy back to output tensor
+                reconstructed[i+j] = torch.tensor(rec_signal, dtype=torch.float32, device=device)
         
-        # Find common output length (use expected_length as target)
-        output_length = self.expected_length
-        
-        # Truncate to output_length
-        reconstructed = reconstructed[:, :output_length]
-        
-        return torch.tensor(reconstructed, dtype=torch.float32, device=device)
+        return reconstructed
     
     def get_output_dim(self, input_length):
-        """Calculate the dimension of wavelet coefficients for a given input length
-        
-        This helps with model initialization by computing the expected output size.
-        
-        Args:
-            input_length: Length of input audio signal
-            
-        Returns:
-            Total number of wavelet coefficients
-        """
-        total_coeffs, _, level_dims = self._calculate_expected_shapes(input_length)
+        """Calculate the dimension of wavelet coefficients for a given input length"""
+        total_coeffs, _, _ = self._calculate_expected_shapes(input_length)
         return total_coeffs
     
     def get_level_dims(self, input_length=None):
-        """Get dimensions of each wavelet decomposition level
-        
-        Args:
-            input_length: Optional input length to update dimensions
-            
-        Returns:
-            List of dimensions for each level [cA, cD_L, cD_{L-1}, ..., cD_1]
-        """
+        """Get dimensions of each wavelet decomposition level"""
         if input_length is not None or self.level_dims is None:
             _, _, self.level_dims = self._calculate_expected_shapes(input_length or self.expected_length)
         
