@@ -4,27 +4,34 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import matplotlib.pyplot as plt
 import numpy as np
-from models.wavelet import WaveletTransform
-from models.autoencoder import WaveletAutoencoder
+from models.wavelet import WaveletTransformOptimized
+from models.level_processor import WaveletLevelProcessor
+from models.conv_autoencoder import ConvWaveletAutoencoder
 from utils.utils import calculate_snr, compute_spectrogram
 
 class WaveletAudioAE(pl.LightningModule):
-    """PyTorch Lightning module for wavelet-based audio autoencoder
+    """Optimized PyTorch Lightning module for wavelet-based audio autoencoder
     
-    Key metrics tracked:
-    - MSE: (1/N)·Σ(x_i - x̂_i)² - direct signal comparison
-    - SNR: 10·log₁₀(Σx_i²/Σ(x_i - x̂_i)²) dB - quality measure
-    - Rate-distortion bound: R(D) ≥ (1/2)·log₂(σ²/D) - theoretical limit
+    Combines three efficiency improvements:
+    1. Coefficient pruning via adaptive thresholding
+    2. Level-based wavelet coefficient processing
+    3. Convolutional encoding/decoding architecture
+    
+    This reduces model size while maintaining or improving quality.
     """
     def __init__(self, config):
         super().__init__()
         self.save_hyperparameters()
         self.config = config
         
-        # Create wavelet transform
-        self.wavelet_transform = WaveletTransform(
+        # Learning rate with scheduling
+        self.learning_rate = config.learning_rate
+        
+        # Create enhanced wavelet transform with pruning
+        self.wavelet_transform = WaveletTransformOptimized(
             wavelet=config.wavelet, 
-            level=config.dwt_level
+            level=config.dwt_level,
+            threshold_factor=2.0  # Control pruning strength
         )
         
         # Get input dimension from wavelet transform based on audio_length
@@ -33,23 +40,37 @@ class WaveletAudioAE(pl.LightningModule):
         print(f"Audio length: {config.audio_length} samples")
         print(f"Wavelet coefficients dimension: {self.input_dim}")
         
-        # Create autoencoder
-        self.autoencoder = WaveletAutoencoder(
+        # Get level dimensions for level-based processing
+        level_dims = self.wavelet_transform.get_level_dims(config.audio_length)
+        print(f"Level dimensions: {level_dims}")
+        
+        # Create level processor
+        self.level_processor = WaveletLevelProcessor(level_dims)
+        
+        # Create convolutional autoencoder
+        # Compression is now distributed across model stages
+        self.autoencoder = ConvWaveletAutoencoder(
             input_dim=self.input_dim,
-            hidden_dims=config.hidden_dims,
-            latent_dim=config.latent_dim
+            latent_dim=config.latent_dim,
+            base_channels=64  # Adjust based on model size needs
         )
         
         # Calculate compression ratio
         self.compression_ratio = config.audio_length / config.latent_dim
         print(f"Compression ratio: {self.compression_ratio:.2f}x")
+        
+        # Track best validation loss for LR scheduling
+        self.best_val_loss = float('inf')
     
-    def forward(self, x):
-        # Apply wavelet transform
-        wavelet_coeffs = self.wavelet_transform.forward(x)
+    def forward(self, x, training=True):
+        # Apply wavelet transform with adaptive pruning
+        wavelet_coeffs = self.wavelet_transform.forward(x, training=training)
+        
+        # Apply level-based processing
+        processed_coeffs = self.level_processor(wavelet_coeffs)
         
         # Encode and decode
-        wavelet_coeffs_recon, z = self.autoencoder(wavelet_coeffs)
+        wavelet_coeffs_recon, z = self.autoencoder(processed_coeffs)
         
         # Apply inverse transform
         x_recon = self.wavelet_transform.inverse(wavelet_coeffs_recon)
@@ -64,72 +85,144 @@ class WaveletAudioAE(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         x = batch
-        x_recon, wavelet_coeffs, wavelet_coeffs_recon, _ = self(x)
+        x_recon, wavelet_coeffs, wavelet_coeffs_recon, _ = self(x, training=True)
+        
+        # Enhanced loss function with frequency-weighted MSE
+        # Low-frequency components more important for perception
         
         # Compute losses
         wavelet_loss = F.mse_loss(wavelet_coeffs_recon, wavelet_coeffs)
         recon_loss = F.mse_loss(x_recon, x)
         
-        # Total loss (with more weight on waveform reconstruction)
-        loss = recon_loss + 0.1 * wavelet_loss
+        # Perceptual scaling of wavelet loss
+        # Give more weight to lower frequency components (approximation coefficients)
+        level_dims = self.wavelet_transform.get_level_dims()
+        start_idx = 0
+        total_loss = recon_loss  # Start with waveform reconstruction
+        
+        # Compute level-specific losses with decreasing weights
+        for i, dim in enumerate(level_dims):
+            end_idx = start_idx + dim
+            level_coeffs = wavelet_coeffs[:, start_idx:end_idx]
+            level_coeffs_recon = wavelet_coeffs_recon[:, start_idx:end_idx]
+            
+            # Decreasing weights for higher-frequency details
+            if i == 0:
+                # Approximation coefficients - highest weight
+                weight = 0.2
+            else:
+                # Detail coefficients - decreasing weights
+                weight = 0.1 / (2 ** (i-1))
+            
+            level_loss = F.mse_loss(level_coeffs_recon, level_coeffs)
+            total_loss = total_loss + weight * level_loss
+            
+            # Track level-specific metrics
+            self.log(f'train_level_{i}_loss', level_loss, on_step=True, on_epoch=True, prog_bar=False)
+            
+            start_idx = end_idx
         
         # Calculate SNR
         snr = calculate_snr(x, x_recon)
         avg_snr = torch.mean(snr)
         
         # Log metrics
-        self.log('train_loss', loss)
-        self.log('train_recon_loss', recon_loss)
-        self.log('train_wavelet_loss', wavelet_loss)
-        self.log('train_snr', avg_snr)
+        self.log('train_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train_recon_loss', recon_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train_wavelet_loss', wavelet_loss, on_step=True, on_epoch=True, prog_bar=False)
+        self.log('train_snr', avg_snr, on_step=True, on_epoch=True, prog_bar=True)
         
         # Periodically log audio and visualizations (less frequently to save resources)
         if (self.global_step % 50 == 0 or batch_idx == 0) and self.global_step > 0:
             self._log_audio_and_visualizations(x, x_recon, wavelet_coeffs, wavelet_coeffs_recon)
         
-        return loss
+        return total_loss
     
     def validation_step(self, batch, batch_idx):
         x = batch
-        x_recon, wavelet_coeffs, wavelet_coeffs_recon, _ = self(x)
+        x_recon, wavelet_coeffs, wavelet_coeffs_recon, _ = self(x, training=False)
         
-        # Compute losses
+        # Compute losses (same as training step but without gradient)
         wavelet_loss = F.mse_loss(wavelet_coeffs_recon, wavelet_coeffs)
         recon_loss = F.mse_loss(x_recon, x)
         
-        # Total loss
-        loss = recon_loss + 0.1 * wavelet_loss
+        # Use same level-based weighting as in training
+        level_dims = self.wavelet_transform.get_level_dims()
+        start_idx = 0
+        total_loss = recon_loss
+        
+        for i, dim in enumerate(level_dims):
+            end_idx = start_idx + dim
+            level_coeffs = wavelet_coeffs[:, start_idx:end_idx]
+            level_coeffs_recon = wavelet_coeffs_recon[:, start_idx:end_idx]
+            
+            if i == 0:
+                weight = 0.2
+            else:
+                weight = 0.1 / (2 ** (i-1))
+            
+            level_loss = F.mse_loss(level_coeffs_recon, level_coeffs)
+            total_loss = total_loss + weight * level_loss
+            
+            # Log metrics - ensure they're logged at epoch level for the scheduler
+            self.log(f'val_level_{i}_loss', level_loss, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+            
+            start_idx = end_idx
         
         # Calculate SNR
         snr = calculate_snr(x, x_recon)
         avg_snr = torch.mean(snr)
         
-        # Log metrics
-        self.log('val_loss', loss)
-        self.log('val_recon_loss', recon_loss)
-        self.log('val_wavelet_loss', wavelet_loss)
-        self.log('val_snr', avg_snr)
+        # Log metrics - ensure they're logged at epoch level for the scheduler
+        self.log('val_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('val_recon_loss', recon_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('val_wavelet_loss', wavelet_loss, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log('val_snr', avg_snr, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         
-        return loss
+        # Update best validation loss for LR scheduling
+        if total_loss < self.best_val_loss:
+            self.best_val_loss = total_loss
+        
+        return total_loss
         
     def test_step(self, batch, batch_idx):
         """Test step for model evaluation"""
         x = batch
-        x_recon, wavelet_coeffs, wavelet_coeffs_recon, _ = self(x)
+        # Use non-training mode for testing (less pruning, better quality)
+        x_recon, wavelet_coeffs, wavelet_coeffs_recon, _ = self(x, training=False)
         
         # Compute losses
         wavelet_loss = F.mse_loss(wavelet_coeffs_recon, wavelet_coeffs)
         recon_loss = F.mse_loss(x_recon, x)
         
-        # Total loss
-        loss = recon_loss + 0.1 * wavelet_loss
+        # Use same level-based weighting as in training/validation
+        level_dims = self.wavelet_transform.get_level_dims()
+        start_idx = 0
+        total_loss = recon_loss
+        
+        for i, dim in enumerate(level_dims):
+            end_idx = start_idx + dim
+            level_coeffs = wavelet_coeffs[:, start_idx:end_idx]
+            level_coeffs_recon = wavelet_coeffs_recon[:, start_idx:end_idx]
+            
+            if i == 0:
+                weight = 0.2
+            else:
+                weight = 0.1 / (2 ** (i-1))
+            
+            level_loss = F.mse_loss(level_coeffs_recon, level_coeffs)
+            total_loss = total_loss + weight * level_loss
+            
+            self.log(f'test_level_{i}_loss', level_loss)
+            
+            start_idx = end_idx
         
         # Calculate SNR
         snr = calculate_snr(x, x_recon)
         avg_snr = torch.mean(snr)
         
         # Log metrics
-        self.log('test_loss', loss)
+        self.log('test_loss', total_loss)
         self.log('test_recon_loss', recon_loss)
         self.log('test_wavelet_loss', wavelet_loss)
         self.log('test_snr', avg_snr)
@@ -138,7 +231,7 @@ class WaveletAudioAE(pl.LightningModule):
         if batch_idx == 0:
             self._log_audio_and_visualizations(x, x_recon, wavelet_coeffs, wavelet_coeffs_recon)
         
-        return loss
+        return total_loss
     
     def _log_audio_and_visualizations(self, x, x_recon, wavelet_coeffs, wavelet_coeffs_recon, window_boundaries=None):
         """Log audio samples and enhanced visualizations to TensorBoard
@@ -235,9 +328,12 @@ class WaveletAudioAE(pl.LightningModule):
         )
         plt.close(fig)
         
-        # 2. Wavelet Coefficient Visualization
+        # 2. Wavelet Coefficient Visualization with Level Boundaries
         coeffs = wavelet_coeffs[sample_idx].cpu().numpy()
         recon_coeffs = wavelet_coeffs_recon[sample_idx].cpu().detach().numpy()
+        
+        # Get level dimensions for visualization
+        level_dims = self.wavelet_transform.get_level_dims()
         
         # Create comparison figure
         fig, axs = plt.subplots(3, 1, figsize=(12, 8))
@@ -251,10 +347,59 @@ class WaveletAudioAE(pl.LightningModule):
         axs[0].set_title('Original Wavelet Coefficients')
         axs[0].grid(True, alpha=0.3)
         
+        # Add level boundary markers
+        start_idx = 0
+        for i, dim in enumerate(level_dims):
+            if start_idx < view_size:
+                end_idx = min(start_idx + dim, view_size)
+                if i == 0:
+                    # Approximation coefficients
+                    axs[0].axvspan(start_idx, end_idx, color='green', alpha=0.1, label='Approx' if i == 0 else None)
+                else:
+                    # Detail coefficients - alternate colors
+                    color = 'blue' if i % 2 == 0 else 'red'
+                    alpha = 0.1 - 0.01 * i  # Decrease opacity for higher levels
+                    axs[0].axvspan(start_idx, end_idx, color=color, alpha=max(0.05, alpha), 
+                                 label=f'Detail L{i}' if start_idx < view_size else None)
+                
+                # Add level name
+                if end_idx - start_idx > 50:  # Only add text if enough space
+                    text_pos = start_idx + (end_idx - start_idx) // 2
+                    if text_pos < view_size:
+                        y_pos = axs[0].get_ylim()[1] * 0.9
+                        axs[0].text(text_pos, y_pos, f'L{i}', fontsize=8, 
+                                  ha='center', va='top', alpha=0.7)
+                
+                start_idx = end_idx
+        
         # Reconstructed coefficients
         axs[1].plot(recon_coeffs[:view_size], 'r-', label='Reconstructed')
         axs[1].set_title('Reconstructed Wavelet Coefficients')
         axs[1].grid(True, alpha=0.3)
+        
+        # Add the same level boundary markers
+        start_idx = 0
+        for i, dim in enumerate(level_dims):
+            if start_idx < view_size:
+                end_idx = min(start_idx + dim, view_size)
+                if i == 0:
+                    # Approximation coefficients
+                    axs[1].axvspan(start_idx, end_idx, color='green', alpha=0.1)
+                else:
+                    # Detail coefficients - alternate colors
+                    color = 'blue' if i % 2 == 0 else 'red'
+                    alpha = 0.1 - 0.01 * i  # Decrease opacity for higher levels
+                    axs[1].axvspan(start_idx, end_idx, color=color, alpha=max(0.05, alpha))
+                
+                # Add level name
+                if end_idx - start_idx > 50:  # Only add text if enough space
+                    text_pos = start_idx + (end_idx - start_idx) // 2
+                    if text_pos < view_size:
+                        y_pos = axs[1].get_ylim()[1] * 0.9
+                        axs[1].text(text_pos, y_pos, f'L{i}', fontsize=8, 
+                                  ha='center', va='top', alpha=0.7)
+                
+                start_idx = end_idx
         
         # Coefficient difference
         diff = coeffs[:view_size] - recon_coeffs[:view_size]
@@ -262,6 +407,22 @@ class WaveletAudioAE(pl.LightningModule):
         axs[2].set_title('Coefficient Difference')
         axs[2].set_xlabel('Coefficient Index')
         axs[2].grid(True, alpha=0.3)
+        
+        # Add level boundary markers for difference plot too
+        start_idx = 0
+        for i, dim in enumerate(level_dims):
+            if start_idx < view_size:
+                end_idx = min(start_idx + dim, view_size)
+                if i == 0:
+                    # Approximation coefficients
+                    axs[2].axvspan(start_idx, end_idx, color='green', alpha=0.1)
+                else:
+                    # Detail coefficients - alternate colors
+                    color = 'blue' if i % 2 == 0 else 'red'
+                    alpha = 0.1 - 0.01 * i  # Decrease opacity for higher levels
+                    axs[2].axvspan(start_idx, end_idx, color=color, alpha=max(0.05, alpha))
+                
+                start_idx = end_idx
         
         # Set consistent y-limits for comparison
         coeff_max = max(np.max(np.abs(coeffs[:view_size])), np.max(np.abs(recon_coeffs[:view_size])))
@@ -350,7 +511,7 @@ class WaveletAudioAE(pl.LightningModule):
         axs[1].set_xticklabels([f'{spec_times[i]:.2f}' for i in time_indices])
         
         # Add colorbar
-        #fig.colorbar(im0, ax=axs, orientation='vertical', label='Power (dB)')
+        fig.colorbar(im0, ax=axs, orientation='vertical', label='Power (dB)')
         
         # Add window boundary markers if available
         if window_boundaries is not None:
@@ -372,4 +533,26 @@ class WaveletAudioAE(pl.LightningModule):
         plt.close(fig)
     
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.config.learning_rate)
+        """Configure optimizers with learning rate scheduling"""
+        optimizer = torch.optim.AdamW(
+            self.parameters(), 
+            lr=self.learning_rate,
+            weight_decay=1e-4  # L2 regularization for better generalization
+        )
+        
+        # Use reduced LR on plateau scheduler
+        scheduler = {
+            'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=0.5,  # Reduce LR by half when plateau
+                patience=20,
+                min_lr=1e-6,
+                verbose=True
+            ),
+            'monitor': 'val_loss',  # Monitor validation loss
+            'interval': 'epoch',
+            'frequency': 1
+        }
+        
+        return [optimizer], [scheduler]
