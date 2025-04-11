@@ -13,7 +13,7 @@ def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Train Optimized Wavelet Echo Matrix (WEM) model')
     parser.add_argument('--config', default='config/model.yaml', help='Path to config file')
-    parser.add_argument('--output_dir', default='outputs_optimized', help='Output directory')
+    parser.add_argument('--output_dir', default='outputs', help='Output directory')
     parser.add_argument('--precision', default='16-mixed', choices=['32', '16-mixed'], 
                         help='Use mixed precision training for better performance')
     parser.add_argument('--gradient_clip_val', type=float, default=1.0, 
@@ -69,7 +69,7 @@ def main():
         devices=1,
         precision=args.precision,  # Use mixed precision for better performance
         gradient_clip_val=args.gradient_clip_val,  # Prevent exploding gradients
-        check_val_every_n_epoch=5,  # Validate less frequently to speed up training
+        check_val_every_n_epoch=1,  # Validate less frequently to speed up training
         callbacks=[checkpoint_callback, lr_monitor, early_stopping]
     )
     
