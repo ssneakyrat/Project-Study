@@ -10,10 +10,18 @@ class WaveletMSELoss(nn.Module):
         self.mse = nn.MSELoss(reduction='none')
         
     def _calculate_weights(self):
-        """Calculate exponential weights for each wavelet level"""
+        """
+        Calculate exponential weights for each wavelet level with boost for high-frequency details
+        """
         weights = []
         for j in range(self.levels + 1):  # +1 for approximation coefficients
-            weights.append(2 ** (self.alpha * j))
+            if j == 0:  # Approximation coefficients
+                weights.append(2 ** (self.alpha * j))
+            elif j < 3:  # First 3 detail levels (high frequencies)
+                # Boost high-frequency importance by 2x
+                weights.append(2 ** (self.alpha * j) * 2.0)
+            else:
+                weights.append(2 ** (self.alpha * j))
         return torch.tensor(weights)
     
     def forward(self, pred_coeffs, target_coeffs):
@@ -34,7 +42,8 @@ class WaveletMSELoss(nn.Module):
         # MSE for detail coefficients at each level
         mse_d = []
         for j in range(self.levels):
-            mse_d.append(torch.mean(self.mse(pred_coeffs['d'][j], target_coeffs['d'][j])))
+            level_mse = torch.mean(self.mse(pred_coeffs['d'][j], target_coeffs['d'][j]))
+            mse_d.append(level_mse)
         
         # Combine losses with weights
         mse_all = [mse_a] + mse_d
@@ -82,4 +91,14 @@ class CombinedLoss(nn.Module):
         w_loss = self.wavelet_loss(pred_coeffs, target_coeffs)
         t_loss = self.time_loss(pred, target)
         
-        return self.wavelet_weight * w_loss + self.time_weight * t_loss
+        # Add special frequency-aware component for high-frequency preservation
+        high_freq_loss = 0
+        for j in range(min(3, len(pred_coeffs['d']))):  # Focus on first 3 levels
+            high_freq_loss += torch.mean((pred_coeffs['d'][j] - target_coeffs['d'][j]) ** 2)
+        
+        # Combine all losses
+        combined_loss = (self.wavelet_weight * w_loss + 
+                        self.time_weight * t_loss + 
+                        0.1 * high_freq_loss)  # Add 10% weight for high-freq component
+        
+        return combined_loss

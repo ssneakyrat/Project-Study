@@ -89,7 +89,7 @@ class DWT(torch.nn.Module):
     
     def threshold_coeffs(self, coeffs, lambda_values=None):
         """
-        Apply adaptive thresholding to coefficients
+        Apply adaptive thresholding to coefficients with frequency-aware scaling
         Args:
             coeffs: Dictionary of wavelet coefficients
             lambda_values: Optional threshold parameters
@@ -107,13 +107,15 @@ class DWT(torch.nn.Module):
             batch_size = d.shape[0]
             N = d.shape[1]
             std_d = torch.std(d, dim=1, keepdim=True)
-            T = lambda_values[j] * std_d * torch.sqrt(torch.tensor(2.0 * np.log(N), device=d.device))
+            
+            # Frequency-aware adaptive scaling factor (gentler on high frequencies)
+            # Scale factor decreases for higher frequency bands (lower j value)
+            scale_factor = max(0.3, 1.0 - 0.15 * (self.level - j - 1))
+            
+            T = scale_factor * lambda_values[j] * std_d * torch.sqrt(torch.tensor(2.0 * np.log(N), device=d.device))
             
             # Soft thresholding with proper broadcasting
             d_abs = torch.abs(d)
-            # Create a mask that properly broadcasts across the batch dimension
-            mask = d_abs > T
-            
             # Initialize thresholded tensor with zeros
             thresholded_d = torch.zeros_like(d)
             

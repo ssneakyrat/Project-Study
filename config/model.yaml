@@ -2,14 +2,14 @@
 model:
   wavelet: 'db4'     # Wavelet type
   levels: 4          # Reduced from 6 to 4 wavelet decomposition levels
-  hidden_dim: 64     # Reduced from 128 to 64
+  hidden_dim: 64     # Base dimension for hidden layers
   latent_dim: 256    # Latent dimension (unchanged)
   
 # Training hyperparameters
 training:
   batch_size: 32
   learning_rate: 0.001
-  weight_decay: 0.0001  # Increased slightly for better regularization
+  weight_decay: 0.0001  # L2 regularization
   max_epochs: 100
   gradient_clip_val: 1.0
   
@@ -17,7 +17,7 @@ training:
 loss:
   wavelet_loss_weight: 0.7
   time_loss_weight: 0.3
-  loss_alpha: 0.5    # Weight increment factor for multi-scale loss
+  loss_alpha: 0.6    # Increased from 0.5 to 0.6 to emphasize high-frequency detail
   
 # Data hyperparameters
 data:
@@ -26,14 +26,14 @@ data:
   num_workers: 4
   
 # Mixed precision training
-precision: 16        # Use FP16 for faster training
+precision: 16-mixed        # Use FP16 for faster training
   
 # Logging
 logging:
   log_every_n_steps: 50
   logs_dir: 'logs'   # Directory for TensorBoard logs
-  viz_every_n_epochs: 5  # Visualize validation samples every n epochs
-  viz_num_samples: 1     # Number of samples to visualize
+  viz_every_n_epochs: 3  # Visualize validation samples more frequently (was 5)
+  viz_num_samples: 2     # Number of samples to visualize
 
 # Data generation parameters
 data_generation:

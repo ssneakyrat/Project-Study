@@ -24,9 +24,30 @@ class ResidualBlock(nn.Module):
         out = self.lrelu2(out)
         return out
 
+class FrequencyAwareBlock(nn.Module):
+    """
+    Specialized block for high-frequency detail processing
+    """
+    def __init__(self, channels, kernel_size=3):
+        super(FrequencyAwareBlock, self).__init__()
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=kernel_size//2, groups=2)
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.lrelu1 = nn.LeakyReLU(0.1)  # Gentler activation for details
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=kernel_size//2)
+        self.bn2 = nn.BatchNorm1d(channels)
+        self.lrelu2 = nn.LeakyReLU(0.1)
+        
+    def forward(self, x):
+        residual = x
+        out = self.lrelu1(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out + residual  # Skip connection
+        out = self.lrelu2(out)
+        return out
+
 class UnifiedEncoder(nn.Module):
     """
-    Simplified unified encoder for wavelet coefficients with better gradient flow
+    Enhanced unified encoder for wavelet coefficients with improved high-frequency processing
     """
     def __init__(self, levels=4, hidden_dim=64):
         super(UnifiedEncoder, self).__init__()
@@ -36,31 +57,67 @@ class UnifiedEncoder(nn.Module):
         # Initial convolutions for each coefficient level
         self.initial_convs = nn.ModuleList()
         for i in range(levels + 1):  # +1 for approximation coefficients
-            # Use smaller kernels for higher frequency details
-            kernel_size = 5 if i >= levels-1 else 7
-            self.initial_convs.append(
-                nn.Sequential(
-                    nn.Conv1d(1, hidden_dim, kernel_size=kernel_size, padding=kernel_size//2),
-                    nn.BatchNorm1d(hidden_dim),
-                    nn.LeakyReLU(0.2)
+            if i == 0:  # Approximation coefficients
+                # Standard processing for low frequencies
+                kernel_size = 7
+                self.initial_convs.append(
+                    nn.Sequential(
+                        nn.Conv1d(1, hidden_dim, kernel_size=kernel_size, padding=kernel_size//2),
+                        nn.BatchNorm1d(hidden_dim),
+                        nn.LeakyReLU(0.2)
+                    )
                 )
-            )
+            elif i < 3:  # First 3 detail levels (high frequencies)
+                # Enhanced processing for high frequencies
+                kernel_size = 3  # Smaller kernel for better detail preservation
+                self.initial_convs.append(
+                    nn.Sequential(
+                        nn.Conv1d(1, hidden_dim, kernel_size=kernel_size, padding=kernel_size//2),
+                        nn.BatchNorm1d(hidden_dim),
+                        nn.LeakyReLU(0.1),  # Gentler activation
+                        nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size, padding=kernel_size//2),
+                        nn.BatchNorm1d(hidden_dim),
+                        nn.LeakyReLU(0.1)
+                    )
+                )
+            else:
+                # Standard processing for mid/low frequencies
+                kernel_size = 5
+                self.initial_convs.append(
+                    nn.Sequential(
+                        nn.Conv1d(1, hidden_dim, kernel_size=kernel_size, padding=kernel_size//2),
+                        nn.BatchNorm1d(hidden_dim),
+                        nn.LeakyReLU(0.2)
+                    )
+                )
         
         # Unified processing blocks with residual connections
         self.encoder_blocks = nn.ModuleList()
         for i in range(levels + 1):
-            self.encoder_blocks.append(
-                nn.Sequential(
-                    ResidualBlock(hidden_dim),
-                    ResidualBlock(hidden_dim)
+            if i < 3:  # High-frequency specific processing
+                self.encoder_blocks.append(
+                    nn.Sequential(
+                        FrequencyAwareBlock(hidden_dim),
+                        FrequencyAwareBlock(hidden_dim)
+                    )
                 )
-            )
+            else:
+                self.encoder_blocks.append(
+                    nn.Sequential(
+                        ResidualBlock(hidden_dim),
+                        ResidualBlock(hidden_dim)
+                    )
+                )
         
         # Progressive downsampling with preserved information
         self.downsample = nn.ModuleList()
         for i in range(levels + 1):
-            # Different downsampling factors based on coefficient length
-            factor = min(2**(levels-i), 8)  # Limit maximum downsampling
+            if i < 3:  # Reduced downsampling for high frequencies
+                # Less aggressive downsampling to preserve high-frequency details
+                factor = max(2, min(2**(levels-i-1), 4))
+            else:
+                factor = min(2**(levels-i), 8)  # Standard downsampling for others
+                
             self.downsample.append(
                 nn.Sequential(
                     nn.Conv1d(hidden_dim, hidden_dim*2, kernel_size=factor+1, stride=factor, padding=1),
@@ -124,7 +181,7 @@ class UnifiedEncoder(nn.Module):
 
 class UnifiedDecoder(nn.Module):
     """
-    Simplified unified decoder with better gradient flow and skip connections
+    Enhanced unified decoder with better detail reconstruction capabilities
     """
     def __init__(self, levels=4, hidden_dim=64, latent_dim=256):
         super(UnifiedDecoder, self).__init__()
@@ -141,34 +198,66 @@ class UnifiedDecoder(nn.Module):
         # Branch-specific feature generators
         self.branch_projections = nn.ModuleList()
         for i in range(levels + 1):
-            self.branch_projections.append(
-                nn.Sequential(
-                    nn.Linear(512, hidden_dim * 4),
-                    nn.LayerNorm(hidden_dim * 4),
-                    nn.LeakyReLU(0.2)
+            if i < 3:  # High-frequency branches get more capacity
+                # For high frequencies, we use a larger initial feature size (hidden_dim * 4)
+                # Note: The view operation reshapes to [B, hidden_dim, 4], so we need hidden_dim * 4
+                self.branch_projections.append(
+                    nn.Sequential(
+                        nn.Linear(512, hidden_dim * 4),  # Changed from 6 to 4
+                        nn.LayerNorm(hidden_dim * 4),
+                        nn.LeakyReLU(0.1)
+                    )
                 )
-            )
+            else:
+                self.branch_projections.append(
+                    nn.Sequential(
+                        nn.Linear(512, hidden_dim * 4),
+                        nn.LayerNorm(hidden_dim * 4),
+                        nn.LeakyReLU(0.2)
+                    )
+                )
         
         # Unified decoder blocks with residual connections
         self.decoder_blocks = nn.ModuleList()
         for i in range(levels + 1):
-            # Add extra input channels for skip connections
-            self.decoder_blocks.append(
-                nn.Sequential(
-                    nn.Conv1d(hidden_dim*2, hidden_dim, kernel_size=3, padding=1),
-                    nn.BatchNorm1d(hidden_dim),
-                    nn.LeakyReLU(0.2),
-                    ResidualBlock(hidden_dim),
-                    ResidualBlock(hidden_dim)
+            if i < 3:  # High-frequency specific processing
+                # Add extra capacity and specialized processing for high frequencies
+                self.decoder_blocks.append(
+                    nn.Sequential(
+                        nn.Conv1d(hidden_dim*2, hidden_dim, kernel_size=3, padding=1),
+                        nn.BatchNorm1d(hidden_dim),
+                        nn.LeakyReLU(0.1),
+                        FrequencyAwareBlock(hidden_dim, kernel_size=3),
+                        FrequencyAwareBlock(hidden_dim, kernel_size=3)
+                    )
                 )
-            )
+            else:
+                # Standard processing for other frequencies
+                self.decoder_blocks.append(
+                    nn.Sequential(
+                        nn.Conv1d(hidden_dim*2, hidden_dim, kernel_size=3, padding=1),
+                        nn.BatchNorm1d(hidden_dim),
+                        nn.LeakyReLU(0.2),
+                        ResidualBlock(hidden_dim),
+                        ResidualBlock(hidden_dim)
+                    )
+                )
         
-        # Final output layers
+        # Final output layers with enhanced detail preservation
         self.output_layers = nn.ModuleList()
         for i in range(levels + 1):
-            self.output_layers.append(
-                nn.Conv1d(hidden_dim, 1, kernel_size=3, padding=1)
-            )
+            if i < 3:  # High-frequency detail reconstruction
+                self.output_layers.append(
+                    nn.Sequential(
+                        nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                        nn.LeakyReLU(0.1),
+                        nn.Conv1d(hidden_dim, 1, kernel_size=3, padding=1)
+                    )
+                )
+            else:
+                self.output_layers.append(
+                    nn.Conv1d(hidden_dim, 1, kernel_size=3, padding=1)
+                )
     
     def forward(self, z, encoded_features, orig_shapes):
         """
@@ -187,6 +276,7 @@ class UnifiedDecoder(nn.Module):
         
         # Reconstruct approximation coefficients
         a_shape = orig_shapes['a']
+        # All branches now use the same feature size (4)
         a_feat = self.branch_projections[0](h).view(batch_size, self.hidden_dim, 4)
         
         # Upsample to match encoder feature size then concatenate with encoder features
@@ -205,6 +295,7 @@ class UnifiedDecoder(nn.Module):
         d_outs = []
         for j in range(self.levels):
             d_shape = orig_shapes['d'][j]
+            # All branches now use the same feature size (4)
             d_feat = self.branch_projections[j+1](h).view(batch_size, self.hidden_dim, 4)
             
             # Upsample to match encoder feature size then concatenate with encoder features
@@ -262,7 +353,7 @@ class WaveletEchoMatrix(nn.Module):
         # Normalize coefficients with improved stability
         norm_coeffs, stats = self.dwt.normalize_coeffs(coeffs)
         
-        # Apply adaptive thresholding for sparsity
+        # Apply frequency-aware adaptive thresholding for sparsity
         thresh_coeffs = self.dwt.threshold_coeffs(norm_coeffs)
         
         # Encode to latent space
