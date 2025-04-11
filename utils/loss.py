@@ -7,7 +7,7 @@ class WaveletLoss(nn.Module):
     Combined loss function for the wavelet network:
     Loss = MSE(x, x̂) + L1(W_ψ[x], W_ψ[x̂]) + KL(z, N(0,1))
     """
-    def __init__(self, wavelet_transform, mse_weight=1.0, wavelet_weight=1.0, kl_weight=1.0):
+    def __init__(self, wavelet_transform, mse_weight=1.0, wavelet_weight=1.0, kl_weight=0.1):
         super().__init__()
         self.wavelet_transform = wavelet_transform
         self.mse_weight = mse_weight
@@ -22,8 +22,8 @@ class WaveletLoss(nn.Module):
             x: Original signal [B, 1, T]
             x_hat: Reconstructed signal [B, 1, T]
             z: Latent vector (optional)
-            z_mean: Mean of latent space (optional, for KL divergence)
-            z_logvar: Log variance of latent space (optional, for KL divergence)
+            z_mean: Mean of latent space for KL divergence
+            z_logvar: Log variance of latent space for KL divergence
             
         Returns:
             Total loss and dictionary of individual loss components

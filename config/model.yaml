@@ -6,6 +6,9 @@ model:
   bottleneck_channels: 256  # Number of bottleneck channels
   wavelet_type: "morlet"  # Options: morlet, mexican_hat, learnable
   wavelet_mlp_layers: [1, 32, 64, 32]  # Wavelet parameter network layers
+  use_vq: false  # Whether to use Vector Quantization
+  num_embeddings: 512  # Number of codebook entries for VQ
+  condition_dim: 256  # Dimension of conditioning embeddings
 
 # Training parameters
 training:
@@ -14,6 +17,15 @@ training:
   max_epochs: 50
   gradient_accumulation: 1
   num_workers: 4
+  mse_weight: 1.0
+  wavelet_weight: 1.0
+  kl_weight: 0.1
+  vq_weight: 0.1
+  lr_scheduler:  # Optional learning rate scheduler
+    type: "step"  # Options: step, cosine
+    step_size: 10
+    gamma: 0.5
+    T_max: 10  # Only used for cosine scheduler
 
 # Data parameters
 data:
@@ -22,6 +34,8 @@ data:
   sample_rate: 16000
   train_size: 1000  # Number of training samples
   val_size: 200     # Number of validation samples
+  use_conditioning: false
+  num_conditions: 10
   
 # Logging
 logging:

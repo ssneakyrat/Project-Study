@@ -4,55 +4,127 @@ import torch.nn.functional as F
 import numpy as np
 import pytorch_lightning as pl
 
+class WaveletParameterNetwork(nn.Module):
+    """
+    Neural network that learns to modulate the wavelet function
+    ψ_θ(t) = ψ(t) · f_θ(t) where f_θ is learnable
+    """
+    def __init__(self, config, channels=16, kernel_size=101):
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        
+        # Get MLP configuration
+        mlp_layers = config['model'].get('wavelet_mlp_layers', [1, 32, 64, 32])
+        
+        # Build MLP dynamically from configuration
+        layers = []
+        for i in range(len(mlp_layers) - 1):
+            layers.append(nn.Linear(mlp_layers[i], mlp_layers[i+1]))
+            if i < len(mlp_layers) - 2:  # No activation after the last layer
+                layers.append(nn.LeakyReLU())
+        
+        # Add the final output layer
+        layers.append(nn.Linear(mlp_layers[-1], channels))
+        layers.append(nn.Sigmoid())  # Output in [0,1] range for stable modulation
+        
+        self.mlp = nn.Sequential(*layers)
+        
+    def forward(self, t):
+        """
+        Generate modulation factors for wavelet functions
+        t: Tensor of shape [kernel_size] with normalized positions in [-1, 1]
+        Returns: Tensor of shape [channels, kernel_size]
+        """
+        # Reshape t for processing
+        t = t.view(-1, 1)  # [kernel_size, 1]
+        
+        # Generate modulation factors for each position
+        modulation = self.mlp(t)  # [kernel_size, channels]
+        
+        # Transpose to get [channels, kernel_size]
+        return modulation.transpose(0, 1)
+
 class AdaptiveWaveletTransform(nn.Module):
-    def __init__(self, wavelet_type="morlet", channels=16, input_size=16000):
+    def __init__(self, config, wavelet_type="morlet", channels=16, input_size=16000):
         super().__init__()
         self.wavelet_type = wavelet_type
         self.channels = channels
         self.input_size = input_size
         self.output_size = input_size // 2
+        self.kernel_size = 101
         
-        # Create fixed filter banks instead of adaptive filters for initial implementation
-        # We'll use Morlet wavelets with different scales
+        # Base wavelet filter bank
         self.filter_bank = nn.Conv1d(
-            1, channels, kernel_size=101, padding=50, bias=False
+            1, channels, kernel_size=self.kernel_size, padding=self.kernel_size//2, bias=False
         )
         
-        # Initialize the filter bank with Morlet wavelets at different scales
-        with torch.no_grad():
-            scales = torch.logspace(1, 3, channels)
-            for i, scale in enumerate(scales):
-                t = torch.linspace(-50, 50, 101)
-                # Morlet wavelet: e^(-t²/2) * cos(5t)
-                morlet = torch.exp(-t**2/(2*scale**2)) * torch.cos(5*t/scale)
-                # Normalize
-                morlet = morlet / torch.sqrt(scale) / torch.norm(morlet)
-                self.filter_bank.weight[i, 0, :] = morlet
+        # Initialize with selected wavelet type
+        self._initialize_wavelets(wavelet_type)
         
-        # Simple channel attention to allow adaptive weighting
-        self.channel_attention = nn.Sequential(
-            nn.Conv1d(channels, channels, kernel_size=1),
-            nn.Sigmoid()
-        )
+        # Wavelet parameter network for adaptive modulation
+        # Implements ψ_θ(t) = ψ(t) · f_θ(t)
+        self.parameter_network = WaveletParameterNetwork(config, channels, self.kernel_size)
         
-        # Feature modulation - approximates the adaptive part
+        # Register normalized position vector as a buffer (non-parameter tensor)
+        t = torch.linspace(-1, 1, self.kernel_size)
+        self.register_buffer('t', t)
+        
+        # Adaptive feature modulation
         self.feature_modulation = nn.Conv1d(channels, channels, kernel_size=1)
+    
+    def _initialize_wavelets(self, wavelet_type):
+        """Initialize filter bank with specified wavelet type"""
+        with torch.no_grad():
+            scales = torch.logspace(1, 3, self.channels)
+            t = torch.linspace(-50, 50, self.kernel_size)
+            
+            for i, scale in enumerate(scales):
+                if wavelet_type == "morlet":
+                    # Morlet wavelet: e^(-t²/2σ²) * cos(5t/σ)
+                    wavelet = torch.exp(-t**2/(2*scale**2)) * torch.cos(5*t/scale)
+                elif wavelet_type == "mexican_hat":
+                    # Mexican hat (second derivative of Gaussian): (1 - t²/σ²) * e^(-t²/2σ²)
+                    wavelet = (1 - t**2/scale**2) * torch.exp(-t**2/(2*scale**2))
+                elif wavelet_type == "learnable":
+                    # Initialize with Morlet but will be fully learnable
+                    wavelet = torch.exp(-t**2/(2*scale**2)) * torch.cos(5*t/scale)
+                    # Don't freeze this parameter
+                    self.filter_bank.weight.requires_grad = True
+                else:
+                    raise ValueError(f"Unknown wavelet type: {wavelet_type}")
+                
+                # Normalize
+                wavelet = wavelet / torch.sqrt(scale) / torch.norm(wavelet)
+                self.filter_bank.weight[i, 0, :] = wavelet
+                
+            # Only freeze weights if not using learnable wavelets
+            if wavelet_type != "learnable":
+                self.filter_bank.weight.requires_grad = False
     
     def forward(self, x):
         """
-        Simplified wavelet transform using fixed filter bank
+        Adaptive wavelet transform implementing W_ψx = |a|^(-1/2) ∫x(t)ψ_θ((t-b)/a)dt
         x: Tensor of shape [B, 1, T]
         Returns: Tensor of shape [B, C, T/2]
         """
-        # Apply filter bank (equivalent to wavelet transform with fixed wavelets)
-        # This implements W_ψx = |a|^(-1/2) ∫x(t)ψ((t-b)/a)dt with fixed ψ
-        wavelet_output = self.filter_bank(x)  # [B, C, T]
+        batch_size = x.shape[0]
         
-        # Apply channel attention (adaptive weighting)
-        attention = self.channel_attention(wavelet_output)
-        wavelet_output = wavelet_output * attention
+        # Get modulation factors from parameter network
+        # This implements f_θ(t) in ψ_θ(t) = ψ(t) · f_θ(t)
+        modulation = self.parameter_network(self.t)  # [C, K]
         
-        # Apply feature modulation (approximates the adaptive part of ψ_θ(t) = ψ(t) · f_θ(t))
+        # Apply modulation to filter bank weights to create adaptive wavelets
+        # This implements ψ_θ(t) = ψ(t) · f_θ(t)
+        adaptive_filters = self.filter_bank.weight * modulation.unsqueeze(1)  # [C, 1, K]
+        
+        # Apply adaptive wavelet transform using F.conv1d
+        # This implements W_ψx = |a|^(-1/2) ∫x(t)ψ_θ((t-b)/a)dt
+        wavelet_output = F.conv1d(
+            x, adaptive_filters, padding=self.kernel_size//2
+        )
+        
+        # Apply feature modulation for additional adaptivity
         wavelet_output = self.feature_modulation(wavelet_output)
         
         # Downsample to target length
@@ -64,25 +136,33 @@ class WaveletEncoder(pl.LightningModule):
         self.save_hyperparameters()
         self.config = config
         
+        # Extract configuration
+        input_size = config['model']['input_size']
+        wavelet_channels = config['model']['wavelet_channels']
+        hidden_channels = config['model']['hidden_channels']
+        bottleneck_channels = config['model']['bottleneck_channels']
+        wavelet_type = config['model']['wavelet_type']
+        
         # Adaptive wavelet transform: [B,1,16000] → [B,16,8000]
         self.wavelet_transform = AdaptiveWaveletTransform(
-            wavelet_type=config['model']['wavelet_type'],
-            channels=config['model']['wavelet_channels'],
-            input_size=config['model']['input_size']
+            config=config,
+            wavelet_type=wavelet_type,
+            channels=wavelet_channels,
+            input_size=input_size
         )
         
         # Feature extraction: 2×Conv1D(kernel=3,stride=2) → [B,32,2000]
         self.conv1 = nn.Conv1d(
-            config['model']['wavelet_channels'],
-            config['model']['hidden_channels'],
+            wavelet_channels,
+            hidden_channels,
             kernel_size=3,
             stride=2,
             padding=1
         )
         
         self.conv2 = nn.Conv1d(
-            config['model']['hidden_channels'],
-            config['model']['hidden_channels'],
+            hidden_channels,
+            hidden_channels,
             kernel_size=3,
             stride=2,
             padding=1
@@ -90,8 +170,8 @@ class WaveletEncoder(pl.LightningModule):
         
         # Bottleneck: Conv1D(kernel=5) → [B,256,2000] → Avg-pool → [B,256]
         self.bottleneck = nn.Conv1d(
-            config['model']['hidden_channels'],
-            config['model']['bottleneck_channels'],
+            hidden_channels,
+            bottleneck_channels,
             kernel_size=5,
             stride=1,
             padding=2
@@ -99,12 +179,19 @@ class WaveletEncoder(pl.LightningModule):
         
         # Global average pooling
         self.global_avgpool = nn.AdaptiveAvgPool1d(1)
+        
+        # Additional outputs for VAE-style latent space, enables KL loss
+        self.fc_mean = nn.Linear(bottleneck_channels, bottleneck_channels)
+        self.fc_logvar = nn.Linear(bottleneck_channels, bottleneck_channels)
     
     def forward(self, x):
         """
         Forward pass through the encoder
         x: [B, 1, T] where T is input_size (16000)
-        Returns: [B, 256] bottleneck representation
+        Returns: 
+          z: Sampled latent vector [B, 256]
+          z_mean: Mean vector [B, 256]
+          z_logvar: Log variance vector [B, 256]
         """
         # Wavelet transform: [B, 1, 16000] → [B, 16, 8000]
         x = self.wavelet_transform(x)
@@ -122,16 +209,25 @@ class WaveletEncoder(pl.LightningModule):
         # Flatten → [B, 256]
         x = x.flatten(1)
         
-        return x
+        # VAE reparameterization
+        z_mean = self.fc_mean(x)
+        z_logvar = self.fc_logvar(x)
+        
+        # Sample from the distribution
+        std = torch.exp(0.5 * z_logvar)
+        eps = torch.randn_like(std)
+        z = z_mean + eps * std
+        
+        return z, z_mean, z_logvar
     
     def training_step(self, batch, batch_idx):
         x = batch
         
         # Encode
-        z = self(x)
+        z, z_mean, z_logvar = self(x)
         
-        # Use MSE loss between z and a random target for testing
-        # In a real implementation, this would be replaced with the actual loss
+        # For standalone encoder testing only
+        # In real implementation, loss calculation is handled by the full model
         target = torch.randn_like(z)
         loss = F.mse_loss(z, target)
         
@@ -144,9 +240,9 @@ class WaveletEncoder(pl.LightningModule):
         x = batch
         
         # Encode
-        z = self(x)
+        z, z_mean, z_logvar = self(x)
         
-        # Simple validation metric
+        # Simple validation metric for standalone testing
         target = torch.randn_like(z)
         loss = F.mse_loss(z, target)
         

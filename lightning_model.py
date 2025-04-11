@@ -30,6 +30,7 @@ class AdaptiveWaveletNetwork(pl.LightningModule):
         
         # Initialize wavelet transform for loss computation
         self.wavelet_transform = AdaptiveWaveletTransform(
+            config=config,
             wavelet_type=config['model']['wavelet_type'],
             channels=config['model']['wavelet_channels'],
             input_size=config['model']['input_size']
@@ -55,10 +56,10 @@ class AdaptiveWaveletNetwork(pl.LightningModule):
             condition: Optional conditioning tensor
             
         Returns:
-            Reconstructed audio
+            Reconstructed audio, sampled latent, mean, logvar
         """
         # Encode input to latent space
-        z = self.encoder(x)
+        z, z_mean, z_logvar = self.encoder(x)
         
         # Process latent with optional conditioning
         z_processed = self.processor(z, condition)
@@ -66,7 +67,7 @@ class AdaptiveWaveletNetwork(pl.LightningModule):
         # Decode back to audio
         x_hat = self.decoder(z_processed)
         
-        return x_hat, z
+        return x_hat, z, z_mean, z_logvar
     
     def _get_batch_input(self, batch):
         """Parse batch based on conditioning"""
@@ -83,10 +84,16 @@ class AdaptiveWaveletNetwork(pl.LightningModule):
         x, condition = self._get_batch_input(batch)
         
         # Forward pass
-        x_hat, z = self(x, condition)
+        x_hat, z, z_mean, z_logvar = self(x, condition)
         
-        # Compute loss
-        loss, loss_components = self.loss_fn(x, x_hat, z)
+        # Compute loss with all components
+        loss, loss_components = self.loss_fn(x, x_hat, z, z_mean, z_logvar)
+        
+        # Add VQ loss if present in processor
+        if hasattr(self.processor, 'vq_loss'):
+            vq_weight = self.config.get('training', {}).get('vq_weight', 0.1)
+            loss = loss + vq_weight * self.processor.vq_loss
+            loss_components['vq_loss'] = self.processor.vq_loss.item()
         
         # Log metrics
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -101,10 +108,16 @@ class AdaptiveWaveletNetwork(pl.LightningModule):
         x, condition = self._get_batch_input(batch)
         
         # Forward pass
-        x_hat, z = self(x, condition)
+        x_hat, z, z_mean, z_logvar = self(x, condition)
         
         # Compute loss
-        loss, loss_components = self.loss_fn(x, x_hat, z)
+        loss, loss_components = self.loss_fn(x, x_hat, z, z_mean, z_logvar)
+        
+        # Add VQ loss if present
+        if hasattr(self.processor, 'vq_loss'):
+            vq_weight = self.config.get('training', {}).get('vq_weight', 0.1)
+            loss = loss + vq_weight * self.processor.vq_loss
+            loss_components['vq_loss'] = self.processor.vq_loss.item()
         
         # Log metrics
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)

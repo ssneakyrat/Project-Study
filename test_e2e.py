@@ -88,7 +88,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test Adaptive Wavelet Network")
     parser.add_argument("--config", type=str, default="config/model.yaml", 
                         help="Path to config file")
-    parser.add_argument("--epochs", type=int, default=100, 
+    parser.add_argument("--epochs", type=int, default=10, 
                         help="Number of epochs to train")
     parser.add_argument("--use-conditioning", action="store_true", 
                         help="Use conditioning in the model")

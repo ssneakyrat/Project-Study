@@ -5,15 +5,16 @@ import numpy as np
 import pytorch_lightning as pl
 
 class InverseWaveletTransform(nn.Module):
-    def __init__(self, wavelet_type="morlet", channels=8, output_size=16000):
+    def __init__(self, config, wavelet_type="morlet", channels=8, output_size=16000):
         super().__init__()
         self.wavelet_type = wavelet_type
         self.channels = channels
         self.output_size = output_size
+        self.kernel_size = 101
         
         # Inverse wavelet transform implemented as transposed convolution with stride=2 for upsampling
         self.synthesis_filters = nn.ConvTranspose1d(
-            channels, 1, kernel_size=101, stride=2, padding=50, bias=False
+            channels, 1, kernel_size=self.kernel_size, stride=2, padding=self.kernel_size//2, bias=False
         )
         
         # Initialize the synthesis filters with approximate inverse of analysis filters
@@ -87,7 +88,8 @@ class WaveletDecoder(pl.LightningModule):
         )
         
         # Inverse wavelet transform: [B,8,8000] → [B,1,16000]
-        self.inverse_wavelet = InverseWaveletTransform(
+        self.inverse_wavelet = InverseWaveletTransform( 
+            config,
             wavelet_type=config['model']['wavelet_type'],
             channels=8,
             output_size=config['model']['input_size']
