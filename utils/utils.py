@@ -60,6 +60,49 @@ def plot_spectrogram(waveform, sample_rate=16000, title="Spectrogram"):
     
     return fig
 
+def plot_spectrogram_comparison(original, reconstructed, sample_rate=16000):
+    """
+    Plot comparison between original and reconstructed spectrograms
+    Args:
+        original: Original audio tensor [1, T]
+        reconstructed: Reconstructed audio tensor [1, T]
+        sample_rate: Audio sample rate
+    Returns:
+        Matplotlib Figure
+    """
+    original = original.squeeze().cpu().numpy()
+    reconstructed = reconstructed.squeeze().cpu().numpy()
+    
+    fig = Figure(figsize=(10, 8))
+    
+    # Plot original spectrogram
+    ax1 = fig.add_subplot(2, 1, 1)
+    ax1.specgram(
+        original,
+        NFFT=1024,
+        Fs=sample_rate,
+        noverlap=512,
+        scale='dB'
+    )
+    ax1.set_title("Original Spectrogram")
+    ax1.set_ylabel("Frequency (Hz)")
+    
+    # Plot reconstructed spectrogram
+    ax2 = fig.add_subplot(2, 1, 2)
+    ax2.specgram(
+        reconstructed,
+        NFFT=1024,
+        Fs=sample_rate,
+        noverlap=512,
+        scale='dB'
+    )
+    ax2.set_title("Reconstructed Spectrogram")
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Frequency (Hz)")
+    
+    fig.tight_layout()
+    return fig
+
 def plot_comparison(original, reconstructed, sample_rate=16000):
     """
     Plot comparison between original and reconstructed waveforms

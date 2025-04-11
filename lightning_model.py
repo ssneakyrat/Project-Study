@@ -8,7 +8,7 @@ from models.wavelet_encoder import WaveletEncoder, AdaptiveWaveletTransform
 from models.latent_processor import LatentProcessor
 from models.wavelet_decoder import WaveletDecoder
 from utils.loss import WaveletLoss
-from utils.utils import plot_comparison, compute_metrics, figure_to_tensor
+from utils.utils import plot_comparison, compute_metrics, figure_to_tensor, plot_spectrogram_comparison
 
 class AdaptiveWaveletNetwork(pl.LightningModule):
     """
@@ -118,19 +118,34 @@ class AdaptiveWaveletNetwork(pl.LightningModule):
         
         # Log visual comparison for first batch only
         if batch_idx == 0:
-            # Create comparison plot for the first sample
-            fig = plot_comparison(
+            # Create waveform comparison plot for the first sample
+            waveform_fig = plot_comparison(
                 x[0], 
                 x_hat[0], 
                 sample_rate=self.config['data']['sample_rate']
             )
             
-            # Convert figure to tensor and log to tensorboard
+            # Create spectrogram comparison plot for the first sample
+            spectrogram_fig = plot_spectrogram_comparison(
+                x[0], 
+                x_hat[0], 
+                sample_rate=self.config['data']['sample_rate']
+            )
+            
+            # Convert figures to tensors and log to tensorboard
             if self.logger and hasattr(self.logger, 'experiment'):
-                img_tensor = figure_to_tensor(fig)
+                waveform_img_tensor = figure_to_tensor(waveform_fig)
+                spectrogram_img_tensor = figure_to_tensor(spectrogram_fig)
+                
                 self.logger.experiment.add_image(
-                    'validation_comparison', 
-                    img_tensor, 
+                    'validation_waveform_comparison', 
+                    waveform_img_tensor, 
+                    self.current_epoch
+                )
+                
+                self.logger.experiment.add_image(
+                    'validation_spectrogram_comparison', 
+                    spectrogram_img_tensor, 
                     self.current_epoch
                 )
         

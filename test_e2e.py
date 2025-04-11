@@ -88,7 +88,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test Adaptive Wavelet Network")
     parser.add_argument("--config", type=str, default="config/model.yaml", 
                         help="Path to config file")
-    parser.add_argument("--epochs", type=int, default=5, 
+    parser.add_argument("--epochs", type=int, default=100, 
                         help="Number of epochs to train")
     parser.add_argument("--use-conditioning", action="store_true", 
                         help="Use conditioning in the model")
@@ -98,7 +98,7 @@ if __name__ == "__main__":
                         help="Weight for MSE loss")
     parser.add_argument("--wavelet-weight", type=float, default=0.5, 
                         help="Weight for wavelet domain loss")
-    parser.add_argument("--kl-weight", type=float, default=0.1, 
+    parser.add_argument("--kl-weight", type=float, default=0.5, 
                         help="Weight for KL divergence loss")
     
     args = parser.parse_args()
