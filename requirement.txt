@@ -1,4 +1,2 @@
-kymatio #Wavelet scattering transforms in Python
-scikit-cuda
-cupy==13.0.0
-complextensor
+pywavelets>=1.1.0  # PyWavelets library for comparisons
+pyyaml>=6.0.0  # For config file handling
