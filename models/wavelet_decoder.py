@@ -98,7 +98,7 @@ class WaveletDecoder(pl.LightningModule):
         )
         
         # Reconstruction: 3×Transpose-Conv1D(kernel=4,stride=2) as specified in architecture
-        # [B,128,500] → [B,64,1000] → [B,32,2000] → [B,8,8000]
+        # [B,128,500] → [B,64,1000] → [B,32,2000] → [B,16,4000] → [B,8,8000]
         self.upconv2 = nn.ConvTranspose1d(
             128, 64, kernel_size=4, stride=2, padding=1
         )
@@ -107,9 +107,15 @@ class WaveletDecoder(pl.LightningModule):
             64, 32, kernel_size=4, stride=2, padding=1
         )
         
-        # Modified to match architecture spec: directly go from 32→8 channels with stride=4
+        # Fixed: Split the single stride-4 operation into two stride-2 operations
+        # [B,32,2000] → [B,16,4000]
         self.upconv4 = nn.ConvTranspose1d(
-            32, 8, kernel_size=8, stride=4, padding=2
+            32, 16, kernel_size=4, stride=2, padding=1
+        )
+        
+        # [B,16,4000] → [B,8,8000]
+        self.upconv5 = nn.ConvTranspose1d(
+            16, 8, kernel_size=4, stride=2, padding=1
         )
         
         # Inverse wavelet transform: [B,8,8000] → [B,1,16000]
@@ -133,15 +139,18 @@ class WaveletDecoder(pl.LightningModule):
         # [B,256,125] → Transpose-Conv1D → [B,128,500]
         x = F.relu(self.upconv1(x))
         
-        # Reconstruction: 3×Transpose-Conv1D as specified in architecture
+        # Reconstruction: 4×Transpose-Conv1D as specified in architecture
         # [B,128,500] → [B,64,1000]
         x = F.relu(self.upconv2(x))
         
         # [B,64,1000] → [B,32,2000]
         x = F.relu(self.upconv3(x))
         
-        # [B,32,2000] → [B,8,8000] (single upconv with stride=4 to match architecture)
+        # [B,32,2000] → [B,16,4000]
         x = F.relu(self.upconv4(x))
+        
+        # [B,16,4000] → [B,8,8000]
+        x = F.relu(self.upconv5(x))
         
         # Inverse wavelet transform: [B,8,8000] → [B,1,16000]
         x = self.inverse_wavelet(x)
