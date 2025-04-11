@@ -99,6 +99,10 @@ class AdaptiveWaveletTransform(nn.Module):
         
         # Adaptive feature modulation
         self.feature_modulation = nn.Conv1d(channels, channels, kernel_size=1)
+        
+        # Save the most recent adaptive filters for decoder use
+        self.register_buffer('last_adaptive_filters', torch.zeros(channels, 1, self.kernel_size))
+        self.register_buffer('last_feature_modulation_weights', torch.zeros(channels, channels, 1))
     
     def _initialize_wavelets(self, wavelet_type):
         """Initialize filter bank with specified wavelet type"""
@@ -164,6 +168,9 @@ class AdaptiveWaveletTransform(nn.Module):
         # This implements ψ_θ(t) = ψ(t) · f_θ(t)
         adaptive_filters = self.filter_bank.weight * modulation.unsqueeze(1)  # [C, 1, K]
         
+        # Store current adaptive filters for use in the decoder
+        self.last_adaptive_filters.copy_(adaptive_filters.detach())
+        
         # Apply adaptive wavelet transform using F.conv1d
         # This implements W_ψx = |a|^(-1/2) ∫x(t)ψ_θ((t-b)/a)dt
         wavelet_output = F.conv1d(
@@ -171,10 +178,19 @@ class AdaptiveWaveletTransform(nn.Module):
         )
         
         # Apply feature modulation for additional adaptivity
+        feature_weights = self.feature_modulation.weight.clone()
+        self.last_feature_modulation_weights.copy_(feature_weights.detach())
         wavelet_output = self.feature_modulation(wavelet_output)
         
         # Downsample to target length
         return wavelet_output[:, :, ::2]  # [B, C, T/2]
+    
+    def get_wavelet_parameters(self):
+        """Get the current wavelet parameters for use in the decoder"""
+        return {
+            'adaptive_filters': self.last_adaptive_filters.clone(),
+            'feature_modulation_weights': self.last_feature_modulation_weights.clone()
+        }
 
 class WaveletEncoder(pl.LightningModule):
     def __init__(self, config):
@@ -238,19 +254,25 @@ class WaveletEncoder(pl.LightningModule):
           z: Sampled latent vector [B, 256]
           z_mean: Mean vector [B, 256]
           z_logvar: Log variance vector [B, 256]
+          wavelet_params: Dictionary of wavelet parameters for the decoder
         """
         # Wavelet transform: [B, 1, 16000] → [B, 16, 8000]
         x = self.wavelet_transform(x)
         
-        # Feature extraction: 2×Conv1D → [B, 32, 2000]
+        # First feature extraction conv: [B, 16, 8000] → [B, 32, 4000]
         x = F.relu(self.conv1(x))
+        
+        # Second feature extraction conv: [B, 32, 4000] → [B, 32, 2000]
         x = F.relu(self.conv2(x))
         
         # Bottleneck: Conv1D → [B, 256, 2000]
-        x = F.relu(self.bottleneck(x))
+        x_bottleneck = F.relu(self.bottleneck(x))
+        
+        # Store the shape for potential skip connections or dimensionality reference
+        batch_size, channels, time_dim = x_bottleneck.shape
         
         # Global avg pooling → [B, 256, 1]
-        x = self.global_avgpool(x)
+        x = self.global_avgpool(x_bottleneck)
         
         # Flatten → [B, 256]
         x = x.flatten(1)
@@ -264,13 +286,16 @@ class WaveletEncoder(pl.LightningModule):
         eps = torch.randn_like(std)
         z = z_mean + eps * std
         
-        return z, z_mean, z_logvar
+        # Get wavelet parameters for the decoder
+        wavelet_params = self.wavelet_transform.get_wavelet_parameters()
+        
+        return z, z_mean, z_logvar, wavelet_params
     
     def training_step(self, batch, batch_idx):
         x = batch
         
         # Encode
-        z, z_mean, z_logvar = self(x)
+        z, z_mean, z_logvar, _ = self(x)
         
         # For standalone encoder testing only
         # In real implementation, loss calculation is handled by the full model
@@ -286,7 +311,7 @@ class WaveletEncoder(pl.LightningModule):
         x = batch
         
         # Encode
-        z, z_mean, z_logvar = self(x)
+        z, z_mean, z_logvar, _ = self(x)
         
         # Simple validation metric for standalone testing
         target = torch.randn_like(z)

@@ -66,14 +66,18 @@ class AdaptiveWaveletNetwork(pl.LightningModule):
         Returns:
             Reconstructed audio, sampled latent, mean, logvar
         """
-        # Encode input to latent space
-        z, z_mean, z_logvar = self.encoder(x)
+        # Encode input to latent space and get wavelet parameters
+        z, z_mean, z_logvar, wavelet_params = self.encoder(x)
         
         # Process latent with optional conditioning
         z_processed = self.processor(z, condition)
         
-        # Decode back to audio with overlap-add
-        x_hat, prev_frame = self.decoder.encode_decode(z_processed, use_overlap=self.use_overlap)
+        # Decode back to audio with overlap-add, passing wavelet parameters
+        x_hat, prev_frame = self.decoder.encode_decode(
+            z_processed, 
+            wavelet_params=wavelet_params,
+            use_overlap=self.use_overlap
+        )
         
         return x_hat, z, z_mean, z_logvar
     
