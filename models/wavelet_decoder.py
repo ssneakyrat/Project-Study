@@ -6,10 +6,10 @@ import pytorch_lightning as pl
 from utils.loss import TriangularWindow
 
 class InverseWaveletTransform(nn.Module):
-    def __init__(self, config, wavelet_type="morlet", channels=8, output_size=16000):
+    def __init__(self, config, wavelet_type="morlet", channels=16, output_size=16000):
         super().__init__()
         self.wavelet_type = wavelet_type
-        self.channels = channels
+        self.channels = channels  # Store the expected number of channels
         self.output_size = output_size
         self.kernel_size = 101
         
@@ -18,168 +18,76 @@ class InverseWaveletTransform(nn.Module):
             channels, 1, kernel_size=self.kernel_size, stride=2, padding=self.kernel_size//2, bias=False
         )
         
-        # Initialize the synthesis filters with mathematically accurate inverse wavelets
-        with torch.no_grad():
-            scales = torch.logspace(1, 3, channels)
-            for i, scale in enumerate(scales):
-                t = torch.linspace(-50, 50, 101)
-                
-                # Create synthesis filter that forms a dual frame with the analysis filter
-                if wavelet_type == "morlet":
-                    # Dual frame of Morlet wavelet for perfect reconstruction
-                    morlet = torch.exp(-t**2/(2*scale**2)) * torch.cos(5*t/scale)
-                    morlet = morlet.flip(0)  # Time reversal for dual frame
-                    
-                elif wavelet_type == "mexican_hat":
-                    # Dual frame of Mexican hat wavelet
-                    morlet = (1 - t**2/scale**2) * torch.exp(-t**2/(2*scale**2))
-                    morlet = morlet.flip(0)  # Time reversal
-                    
-                else:  # Default to Morlet
-                    morlet = torch.exp(-t**2/(2*scale**2)) * torch.cos(5*t/scale)
-                    morlet = morlet.flip(0)
-                    
-                # Normalize synthesis filter for energy preservation
-                # |a|^(-1/2) factor from the wavelet transform definition
-                morlet = morlet / torch.sqrt(scale) / torch.norm(morlet)
-                
-                # Enforce symmetry constraints to maintain wavelet admissibility
-                if self.kernel_size % 2 == 1:  # For odd kernel size
-                    center = self.kernel_size // 2
-                    # Make filter symmetric around center for linear phase
-                    symmetric_part = (morlet[:center] + morlet[center+1:].flip(0)) / 2
-                    morlet[:center] = symmetric_part
-                    morlet[center+1:] = symmetric_part.flip(0)
-                
-                self.synthesis_filters.weight[i, 0, :] = morlet
+        # Initialize with basic filters - these will be properly set by the encoder
+        self._initialize_wavelets(wavelet_type)
         
-        # Enforce perfect reconstruction condition: ∑_k h[k]h[2n-k] = δ[n]
-        with torch.no_grad():
-            # Get filter weights
-            weights = self.synthesis_filters.weight.squeeze(1)  # [channels, kernel_size]
-            
-            # Orthogonalize the filter bank for improved perfect reconstruction
-            # Step 1: Compute filter inner products (Gram matrix)
-            gram = torch.mm(weights, weights.t())
-            
-            # Step 2: Apply Cholesky decomposition-based orthogonalization
-            # Add small diagonal term for numerical stability
-            gram += torch.eye(channels, device=weights.device) * 1e-6
-            L = torch.linalg.cholesky(gram)
-            
-            # Step 3: Solve the system (updated to use the newer API)
-            ortho_weights = torch.linalg.solve(L, weights)
-            
-            # Step 4: Normalize each filter
-            for i in range(channels):
-                ortho_weights[i] = ortho_weights[i] / torch.norm(ortho_weights[i])
-            
-            # Update filter weights
-            self.synthesis_filters.weight = nn.Parameter(ortho_weights.unsqueeze(1))
-        
-        # Adaptive modulation for synthesis
-        self.modulation = nn.Conv1d(channels, channels, kernel_size=1)
+        # Channel-wise scaling - dynamically handle channel count in forward()
+        self.register_parameter('scales', nn.Parameter(torch.ones(channels)))
         
         # Flag to indicate if encoder parameters have been set
         self.encoder_params_set = False
     
+    def _initialize_wavelets(self, wavelet_type):
+        """Initialize with basic wavelet filters that will be replaced"""
+        with torch.no_grad():
+            scales = torch.logspace(1, 3, self.channels)
+            for i, scale in enumerate(scales):
+                t = torch.linspace(-50, 50, self.kernel_size)
+                
+                if wavelet_type == "morlet":
+                    wavelet = torch.exp(-t**2/(2*scale**2)) * torch.cos(5*t/scale)
+                    wavelet = wavelet.flip(0)  # Time reversal for synthesis
+                elif wavelet_type == "mexican_hat":
+                    wavelet = (1 - t**2/scale**2) * torch.exp(-t**2/(2*scale**2))
+                    wavelet = wavelet.flip(0)
+                else:
+                    wavelet = torch.exp(-t**2/(2*scale**2)) * torch.cos(5*t/scale)
+                    wavelet = wavelet.flip(0)
+                
+                # Normalize
+                wavelet = wavelet / torch.norm(wavelet)
+                self.synthesis_filters.weight[i, 0, :] = wavelet
+    
     def set_encoder_parameters(self, wavelet_params):
         """
-        Set the synthesis filters and modulation weights using parameters from the encoder
+        Set synthesis filters directly from encoder analysis filters with minimal processing
         
         Args:
-            wavelet_params: Dictionary containing 'adaptive_filters' and 'feature_modulation_weights'
+            wavelet_params: Dictionary containing 'adaptive_filters'
         """
-        if wavelet_params is None:
+        if wavelet_params is None or 'adaptive_filters' not in wavelet_params:
             return
         
-        adaptive_filters = wavelet_params.get('adaptive_filters')
-        feature_modulation_weights = wavelet_params.get('feature_modulation_weights')
+        # Get analysis filters from encoder
+        analysis_filters = wavelet_params['adaptive_filters']
         
-        if adaptive_filters is not None:
-            # Compute synthesis filters that form a biorthogonal system with analysis filters
-            # This enforces the perfect reconstruction condition: ∑_n h[n-2k]g[n] = δ[k]
-            with torch.no_grad():
-                # Extract analysis filters
-                analysis_filters = adaptive_filters.squeeze(1)  # [channels, kernel_size]
-                
-                # To create a biorthogonal system, we need to solve for synthesis filters
-                # that satisfy the perfect reconstruction condition
-                kernel_size = analysis_filters.shape[1]
-                channels = analysis_filters.shape[0]
-                
-                # Step 1: Compute the cross-correlation matrix of analysis filters at even shifts
-                # This represents the inner products between analysis filters at shifts of 2k
-                R = torch.zeros((channels, channels), device=analysis_filters.device)
-                
-                for i in range(channels):
-                    for j in range(channels):
-                        # Compute cross-correlation (convolution with time-reversed filter)
-                        # We only care about even indices for downsampling by 2
-                        h_i = analysis_filters[i]
-                        h_j = analysis_filters[j].flip(0)  # Time-reverse
-                        
-                        # Convolve h_i with time-reversed h_j
-                        # This is equivalent to cross-correlation between h_i and h_j
-                        corr = torch.nn.functional.conv1d(
-                            h_i.view(1, 1, -1), 
-                            h_j.view(1, 1, -1), 
-                            padding=kernel_size-1
-                        ).squeeze()
-                        
-                        # Extract values at even indices (for downsampling by 2)
-                        # Center value represents zero shift
-                        center = corr.size(0) // 2
-                        R[i, j] = corr[center]
-                
-                # Step 2: Add regularization for numerical stability
-                R = R + torch.eye(channels, device=R.device) * 1e-6
-                
-                # Step 3: Compute synthesis filters by inverting the correlation matrix
-                # G = H⁻¹ where H is the matrix of analysis filters
-                try:
-                    R_inv = torch.inverse(R)
-                except:
-                    # If inverse fails, use pseudo-inverse with more regularization
-                    R = R + torch.eye(channels, device=R.device) * 1e-4
-                    R_inv = torch.inverse(R)
-                
-                # Step 4: Apply the inverse to get synthesis filters
-                synthesis_filters = torch.zeros_like(analysis_filters)
-                
-                for i in range(channels):
-                    g_i = torch.zeros(kernel_size, device=analysis_filters.device)
-                    for j in range(channels):
-                        # Apply R_inv to the time-reversed analysis filters
-                        g_i = g_i + R_inv[i, j] * analysis_filters[j].flip(0)
-                    
-                    # Normalize for energy preservation
-                    g_i = g_i / torch.norm(g_i)
-                    
-                    # Ensure filter has zero mean (wavelet admissibility)
-                    g_i = g_i - g_i.mean()
-                    
-                    # Update synthesis filter
-                    synthesis_filters[i] = g_i
-                
-                # Step 5: Reshape and assign to synthesis_filters.weight
-                self.synthesis_filters.weight.copy_(synthesis_filters.unsqueeze(1))
+        # Check for channel mismatch and adapt accordingly
+        encoder_channels = analysis_filters.size(0)
+        if encoder_channels != self.channels:
+            # Rebuild synthesis filters with correct channel count
+            self.channels = encoder_channels
+            self.synthesis_filters = nn.ConvTranspose1d(
+                self.channels, 1, kernel_size=self.kernel_size, 
+                stride=2, padding=self.kernel_size//2, bias=False
+            ).to(analysis_filters.device)
+            
+            # Update scales parameter
+            self.register_parameter('scales', nn.Parameter(torch.ones(self.channels, device=analysis_filters.device)))
         
-        if feature_modulation_weights is not None:
-            # Set modulation weights to match encoder's feature modulation
-            with torch.no_grad():
-                self.modulation.weight.copy_(feature_modulation_weights)
+        # Simple approach: just use time-reversed analysis filters
+        with torch.no_grad():
+            # Time-reverse and transpose for TransposedConv1d
+            synthesis_filters = analysis_filters.flip(2)
+            self.synthesis_filters.weight.copy_(synthesis_filters)
+            
+            # Reset scaling factors to identity
+            self.scales.data.fill_(1.0)
         
         self.encoder_params_set = True
     
     def forward(self, x):
         """
-        Inverse wavelet transform using synthesis filter bank
-        
-        Mathematically implements the inverse continuous wavelet transform:
-        x(t) = C_ψ^(-1) ∫∫ W_ψx(a,b) ψ((t-b)/a) da db/a²
-        
-        where C_ψ is the wavelet admissibility constant.
+        Simple inverse wavelet transform with dynamic channel handling
         
         Args:
             x: Wavelet coefficients [B, C, T]
@@ -187,12 +95,30 @@ class InverseWaveletTransform(nn.Module):
         Returns:
             Reconstructed signal [B, 1, 2*T]
         """
-        # Apply adaptive modulation
-        x = self.modulation(x)
+        # Handle dynamic channel count
+        input_channels = x.size(1)
+        if input_channels != self.channels:
+            # If this happens, it means the encoder hasn't properly set parameters
+            # and we need to adapt to the incoming channel count
+            device = x.device
+            
+            # Rebuild with correct channel count
+            self.channels = input_channels
+            self.synthesis_filters = nn.ConvTranspose1d(
+                self.channels, 1, kernel_size=self.kernel_size, 
+                stride=2, padding=self.kernel_size//2, bias=False
+            ).to(device)
+            
+            # Re-initialize filters
+            self._initialize_wavelets(self.wavelet_type)
+            
+            # Recreate scales parameter with correct size
+            self.register_parameter('scales', nn.Parameter(torch.ones(self.channels, device=device)))
+        
+        # Apply channel-wise scaling - reshape scales to [C, 1, 1] for broadcasting
+        x = x * self.scales.view(-1, 1, 1)
         
         # Apply synthesis filters
-        # This implements the integration over scales and positions
-        # The TransposedConv1d with stride=2 provides the necessary upsampling
         output = self.synthesis_filters(x)
         
         # Ensure output size matches expected dimension
@@ -209,22 +135,17 @@ class WaveletDecoder(pl.LightningModule):
         
         bottleneck_channels = config['model']['bottleneck_channels']
         hidden_channels = config['model']['hidden_channels']
-        wavelet_channels = config['model']['wavelet_channels']  # Use the same number of channels as the encoder
+        wavelet_channels = config['model']['wavelet_channels']
         
-        # Init for debugging
-        self.debug_print = True
-        
-        # Gradual upsampling as specified in architecture
-        # Modified to ensure symmetric alignment with encoder path
-        # [B,256] → Linear → [B,256,2000] (matching encoder's bottleneck dimension)
+        # Upsampling: [B,256] → [B,256,2000]
         self.upsampling = nn.Sequential(
-            nn.Linear(bottleneck_channels, bottleneck_channels * 2000),
+            nn.Linear(bottleneck_channels, bottleneck_channels * 16),
             nn.LeakyReLU(),
-            nn.Unflatten(1, (bottleneck_channels, 2000))
+            nn.Unflatten(1, (bottleneck_channels, 16)),
+            nn.Upsample(scale_factor=125, mode='nearest')
         )
         
-        # Reconstruction with symmetric transpose convolutions to match encoder path
-        # [B,256,2000] → [B,32,2000] (channel reduction)
+        # Channel reduction: [B,256,2000] → [B,32,2000]
         self.channel_reduction = nn.Conv1d(
             bottleneck_channels, 
             hidden_channels,
@@ -233,24 +154,22 @@ class WaveletDecoder(pl.LightningModule):
             padding=0
         )
         
-        # [B,32,2000] → [B,32,4000] (symmetric to encoder's second conv)
+        # [B,32,2000] → [B,32,4000]
         self.upconv1 = nn.ConvTranspose1d(
-            in_channels=hidden_channels,  # Explicitly specify in_channels=32
-            out_channels=hidden_channels, 
+            hidden_channels,
+            hidden_channels, 
             kernel_size=4, 
             stride=2, 
-            padding=1,
-            output_padding=0
+            padding=1
         )
         
-        # [B,32,4000] → [B,16,8000] (symmetric to encoder's first conv)
+        # [B,32,4000] → [B,wavelet_channels,8000]
         self.upconv2 = nn.ConvTranspose1d(
-            in_channels=hidden_channels,  # Explicitly specify in_channels=32 
-            out_channels=wavelet_channels, 
+            hidden_channels,
+            wavelet_channels, 
             kernel_size=4, 
             stride=2, 
-            padding=1,
-            output_padding=0
+            padding=1
         )
         
         # Inverse wavelet transform: [B,wavelet_channels,8000] → [B,1,16000]
@@ -264,11 +183,11 @@ class WaveletDecoder(pl.LightningModule):
         # Triangular window for overlap-add reconstruction
         self.window = TriangularWindow(config['model']['input_size'])
         
-        # Track previous frame for overlapping - starts as None
+        # Track previous frame for overlapping
         self.prev_frame = None
         
         # Overlap factor for frame processing
-        self.overlap_factor = 0.25  # From architecture specification
+        self.overlap_factor = 0.25
     
     def set_encoder_parameters(self, wavelet_params):
         """Set the encoder parameters for the inverse wavelet transform"""
@@ -301,7 +220,6 @@ class WaveletDecoder(pl.LightningModule):
     def process_overlapping_frames(self, frame):
         """
         Process overlapping frames with triangular windowing for smooth reconstruction
-        Implements: x̂ = ∑_t w_t · x̂_t where w_t is a triangular window
         
         Args:
             frame: Current reconstructed frame [B, 1, T]
@@ -370,7 +288,6 @@ class WaveletDecoder(pl.LightningModule):
         x = batch
         
         # For standalone testing, we generate random latent vectors
-        # In real training this would come from the encoder
         batch_size = x.shape[0]
         z = torch.randn(batch_size, self.config['model']['bottleneck_channels'], device=x.device)
         
