@@ -89,7 +89,7 @@ class DWT(torch.nn.Module):
     
     def _position_adaptive_scale(self, level, rel_position):
         """
-        Generate position-dependent scaling factor for thresholding
+        Generate enhanced position-dependent scaling factor for thresholding
         Args:
             level: Wavelet decomposition level
             rel_position: Relative position (0.0 to 1.0)
@@ -97,22 +97,22 @@ class DWT(torch.nn.Module):
             scale: Position-dependent scaling factor
         """
         # Different scaling patterns for different levels to address the observed issues
-        if level == 0:  # Level 1 (highest frequency) - 80% left reconstruction
-            # Gradually increase threshold from left to right (lower threshold = more detail preserved)
-            return 0.6 + 0.8 * rel_position  # 0.6 at left, 1.4 at right
-        elif level == 1:  # Level 2 - 50% right reconstruction
-            # Gradually decrease threshold from left to right
-            return 1.4 - 0.8 * rel_position  # 1.4 at left, 0.6 at right
-        elif level == 2:  # Level 3 - 30% right reconstruction
+        if level == 0:  # Level 1 (highest frequency) - needs boosted right side reconstruction
+            # Gradually decrease threshold from left to right (lower threshold = more detail preserved)
+            return 1.2 - 0.8 * rel_position  # 1.2 at left, 0.4 at right (preserve more detail on right)
+        elif level == 1:  # Level 2 - needs boosted left side reconstruction
+            # Gradually increase threshold from left to right 
+            return 0.4 + 0.8 * rel_position  # 0.4 at left (preserve more detail), 1.2 at right
+        elif level == 2:  # Level 3 - needs strong left side boost
             # Similar pattern to level 2 but more pronounced
-            return 1.6 - 1.0 * rel_position  # 1.6 at left, 0.6 at right
+            return 0.3 + 1.0 * rel_position  # 0.3 at left, 1.3 at right
         else:
             # Neutral scaling for other levels
             return 1.0
     
     def threshold_coeffs(self, coeffs, lambda_values=None):
         """
-        Apply position-aware adaptive thresholding to coefficients
+        Apply enhanced position-aware adaptive thresholding to coefficients
         Args:
             coeffs: Dictionary of wavelet coefficients
             lambda_values: Optional threshold parameters
@@ -132,9 +132,10 @@ class DWT(torch.nn.Module):
             std_d = torch.std(d, dim=1, keepdim=True)
             
             # Frequency-aware adaptive scaling factor (gentler on high frequencies)
-            scale_factor = max(0.2, 1.0 - 0.2 * (self.level - j - 1))
+            # Reduced scaling for all frequencies to preserve more detail
+            scale_factor = max(0.1, 0.8 - 0.2 * (self.level - j - 1))
             
-            # Create position-dependent threshold mask
+            # Create enhanced position-dependent threshold mask with stronger bias correction
             position_mask = torch.ones((batch_size, N), device=d.device)
             for pos in range(N):
                 # Get position-adaptive scale for this level and relative position

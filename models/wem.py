@@ -29,24 +29,34 @@ class AsymmetricFrequencyBlock(nn.Module):
     Enhanced specialized block for high-frequency detail processing
     with position-aware processing and left/right asymmetry
     """
-    def __init__(self, channels, kernel_size=3):
+    def __init__(self, channels, kernel_size=3, level=0):
         super(AsymmetricFrequencyBlock, self).__init__()
+        self.level = level  # Store wavelet level for position-aware processing
         self.norm1 = nn.BatchNorm1d(channels)
         
         # Split channels for direction-sensitive processing
         self.channels_half = channels // 2
         
-        # Direction-sensitive convolutions (left/right awareness)
-        # Using same padding for both to ensure consistent output sizes
+        # Direction-sensitive convolutions with level-specific kernel sizes
+        if level == 0:  # Level 1 (highest freq) - needs most detail preservation on left
+            left_kernel = 3  # Smaller kernel for better left-side detail
+            right_kernel = 7  # Larger kernel for right side
+        elif level == 1:  # Level 2 - needs better right-side detail
+            left_kernel = 7  # Larger kernel for left side
+            right_kernel = 3  # Smaller kernel for better right-side detail
+        else:  # Level 3+ - balanced
+            left_kernel = 5
+            right_kernel = 5
+            
         self.conv_left = nn.Conv1d(self.channels_half, self.channels_half, 
-                                  kernel_size=5, padding=2)
+                                   kernel_size=left_kernel, padding=left_kernel//2)
         self.conv_right = nn.Conv1d(self.channels_half, self.channels_half, 
-                                   kernel_size=5, padding=2)
+                                    kernel_size=right_kernel, padding=right_kernel//2)
         
         self.norm2 = nn.BatchNorm1d(channels)
         self.conv2 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=kernel_size//2)
         
-        # Position-dependent attention mechanism
+        # Enhanced position-dependent attention mechanism
         self.pos_attention = nn.Sequential(
             nn.Conv1d(channels + 1, channels, kernel_size=1),
             nn.Sigmoid()
@@ -63,6 +73,7 @@ class AsymmetricFrequencyBlock(nn.Module):
         
     def forward(self, x):
         residual = x
+        batch_size, channels, seq_len = x.shape
         
         # Normalization
         out = self.norm1(x)
@@ -71,21 +82,36 @@ class AsymmetricFrequencyBlock(nn.Module):
         out_left, out_right = torch.split(out, self.channels_half, dim=1)
         
         # Apply different processing to left and right channels
-        # but keeping sequence length consistent
         out_left = self.conv_left(out_left)
         out_right = self.conv_right(out_right)
         
         # Concatenate channels
         out = torch.cat([out_left, out_right], dim=1)
         
-        # Apply position-dependent attention
-        seq_len = out.size(2)
-        position_encoding = torch.linspace(0, 1, seq_len).view(1, 1, -1).to(out.device)
-        position_encoding = position_encoding.expand(out.size(0), 1, -1)
+        # Generate level-specific position encoding with proper bias correction
+        position = torch.linspace(0, 1, seq_len).view(1, 1, -1).to(out.device)
+        position_encoding = position.expand(batch_size, 1, -1)  # Expand to match batch size
         
-        # Generate position-dependent weights - emphasize different parts based on frequency
-        position_weights = self.pos_attention(torch.cat([out, position_encoding], dim=1))
-        out = out * position_weights
+        # Apply level-specific position-dependent scaling
+        if self.level == 0:  # Level 1 (highest frequency) - strengthen right side
+            # Create position weights that emphasize the right (weak area)
+            position_weights = 1.0 + 1.5 * position  # 1.0 at left, 2.5 at right
+        elif self.level == 1:  # Level 2 - strengthen left side 
+            # Create position weights that emphasize the left (weak area)
+            position_weights = 2.5 - 1.5 * position  # 2.5 at left, 1.0 at right
+        elif self.level == 2:  # Level 3 - stronger left emphasis
+            # Create weights with stronger emphasis on the left side
+            position_weights = 3.0 - 2.0 * position  # 3.0 at left, 1.0 at right
+        else:
+            # Neutral weighting for other levels
+            position_weights = torch.ones_like(position)
+        
+        # Expand position weights to match batch size
+        position_weights = position_weights.expand(batch_size, 1, -1)
+            
+        # Apply position-dependent attention
+        position_aware_attention = self.pos_attention(torch.cat([out, position_encoding], dim=1))
+        out = out * (position_aware_attention * position_weights)
         
         # Second conv layer
         out = self.lrelu(self.norm2(out))
@@ -194,11 +220,11 @@ class UnifiedEncoder(nn.Module):
         # Unified processing blocks with residual connections
         self.encoder_blocks = nn.ModuleList()
         for i in range(levels + 1):
-            if i < 3:  # High-frequency specific processing with asymmetric processing
+            if i < 3:  # High-frequency specific processing with asymmetric blocks
                 self.encoder_blocks.append(
                     nn.Sequential(
-                        AsymmetricFrequencyBlock(hidden_dim),
-                        AsymmetricFrequencyBlock(hidden_dim)
+                        AsymmetricFrequencyBlock(hidden_dim, kernel_size=3, level=i-1),
+                        AsymmetricFrequencyBlock(hidden_dim, kernel_size=3, level=i-1)
                     )
                 )
             else:
@@ -291,6 +317,71 @@ class UnifiedEncoder(nn.Module):
         
         return z, encoded_features
 
+class PositionEnhancedLayer(nn.Module):
+    """
+    New layer to specifically address position-dependent wavelet reconstruction issues
+    """
+    def __init__(self, channels, level, mode='reconstruct'):
+        super(PositionEnhancedLayer, self).__init__()
+        self.level = level
+        self.mode = mode  # 'encode' or 'reconstruct'
+        
+        # Position-aware conv to learn position-specific transformations
+        self.pos_conv = nn.Conv1d(channels + 1, channels, kernel_size=5, padding=2)
+        
+        # Level-specific processing parameters
+        self.alpha = nn.Parameter(torch.tensor(1.0))  # Learnable scaling parameter
+        self.beta = nn.Parameter(torch.tensor(0.5))   # Learnable bias parameter
+        
+        # Final activation
+        self.act = nn.LeakyReLU(0.1)
+        
+    def forward(self, x):
+        batch_size, channels, seq_len = x.shape
+        
+        # Create position encoding
+        position = torch.linspace(0, 1, seq_len).view(1, 1, -1).to(x.device)
+        position = position.expand(batch_size, 1, -1)
+        
+        # Concatenate with input
+        x_with_pos = torch.cat([x, position], dim=1)
+        
+        # Apply position-aware convolution
+        pos_features = self.pos_conv(x_with_pos)
+        
+        # Create level-specific position weights
+        if self.level == 0:  # Detail level 1 - boost right side reconstruction
+            if self.mode == 'reconstruct':
+                # For reconstruction: stronger correction on right side
+                pos_weights = 1.0 + self.alpha * position ** 2
+            else:
+                # For encoding: emphasize left side (where reconstruction is better)
+                pos_weights = 1.0 + self.alpha * (1 - position) ** 2
+                
+        elif self.level == 1:  # Detail level 2 - boost left side reconstruction
+            if self.mode == 'reconstruct':
+                # For reconstruction: stronger correction on left side
+                pos_weights = 1.0 + self.alpha * (1 - position) ** 2
+            else:
+                # For encoding: emphasize right side (where reconstruction is better)
+                pos_weights = 1.0 + self.alpha * position ** 2
+                
+        elif self.level == 2:  # Detail level 3 - strong left boost
+            if self.mode == 'reconstruct':
+                # For reconstruction: stronger correction on left side
+                pos_weights = 1.0 + 1.5 * self.alpha * (1 - position) ** self.beta
+            else:
+                # For encoding: stronger right emphasis
+                pos_weights = 1.0 + self.alpha * position ** self.beta
+        else:
+            # Neutral weighting for other levels
+            pos_weights = torch.ones_like(position)
+        
+        # Apply position-dependent weighting
+        out = x * pos_weights + pos_features
+        
+        return self.act(out)
+
 class UnifiedDecoder(nn.Module):
     """
     Enhanced unified decoder with better detail reconstruction capabilities
@@ -329,6 +420,18 @@ class UnifiedDecoder(nn.Module):
                     )
                 )
         
+        # Position-enhanced layers for targeted detail reconstruction
+        self.position_enhance = nn.ModuleList()
+        for i in range(levels + 1):
+            if i < 3:  # Only for high-frequency detail levels
+                self.position_enhance.append(
+                    PositionEnhancedLayer(hidden_dim, i, mode='reconstruct')
+                )
+            else:
+                self.position_enhance.append(
+                    nn.Identity()  # No special processing for low frequencies
+                )
+        
         # Unified decoder blocks with residual connections
         self.decoder_blocks = nn.ModuleList()
         for i in range(levels + 1):
@@ -338,8 +441,8 @@ class UnifiedDecoder(nn.Module):
                         nn.Conv1d(hidden_dim*2, hidden_dim, kernel_size=3, padding=1),
                         nn.BatchNorm1d(hidden_dim),
                         nn.LeakyReLU(0.1),
-                        AsymmetricFrequencyBlock(hidden_dim, kernel_size=3),
-                        AsymmetricFrequencyBlock(hidden_dim, kernel_size=3)
+                        AsymmetricFrequencyBlock(hidden_dim, kernel_size=3, level=i),
+                        AsymmetricFrequencyBlock(hidden_dim, kernel_size=3, level=i)
                     )
                 )
             else:
@@ -396,6 +499,10 @@ class UnifiedDecoder(nn.Module):
         # Apply decoder blocks
         a_dec = self.decoder_blocks[0](a_concat)
         
+        # Apply position enhancement if needed
+        if isinstance(self.position_enhance[0], PositionEnhancedLayer):
+            a_dec = self.position_enhance[0](a_dec)
+        
         # Final layer and reshape to match original shape
         a_out = self.output_layers[0](a_dec)
         a_out = F.interpolate(a_out, size=a_shape[1], mode='linear')
@@ -421,37 +528,37 @@ class UnifiedDecoder(nn.Module):
             # Apply decoder blocks
             d_dec = self.decoder_blocks[j+1](d_concat)
             
+            # Apply position enhancement for detail coefficients
+            if j < 3 and isinstance(self.position_enhance[j+1], PositionEnhancedLayer):
+                d_dec = self.position_enhance[j+1](d_dec)
+            
             # Final layer and reshape to match original shape
             d_out = self.output_layers[j+1](d_dec)
             
             # Enhanced interpolation for high frequencies
-            if j < 3:
-                d_out = F.interpolate(d_out, size=d_shape[1], mode='linear')
-                
-                # Apply position-dependent gain correction to address observed imbalances
-                position_weights = torch.ones((1, 1, d_shape[1]), device=d_out.device)
-                
-                if j == 0:  # Level 1 (80% left reconstruction) - boost right side
-                    # Create linear weights that increase from left (1.0) to right (2.0)
-                    right_boost = torch.linspace(1.0, 2.0, d_shape[1], device=d_out.device)
-                    position_weights = right_boost.view(1, 1, -1)
-                elif j == 1:  # Level 2 (50% right reconstruction) - boost right side more
-                    # Create weights emphasizing the right side
-                    mid_point = d_shape[1] // 2
-                    left_weights = torch.ones(mid_point, device=d_out.device)
-                    right_weights = torch.linspace(1.0, 2.5, d_shape[1] - mid_point, device=d_out.device)
-                    position_weights = torch.cat([left_weights, right_weights], dim=0).view(1, 1, -1)
-                elif j == 2:  # Level 3 (30% right reconstruction) - strong right boost
-                    # Create weights with stronger emphasis on the right side
-                    position_weights = torch.ones((1, 1, d_shape[1]), device=d_out.device)
-                    right_start = int(0.6 * d_shape[1])
-                    position_weights[:, :, right_start:] = 3.0
-                
-                # Apply position-dependent weights
-                d_out = d_out * position_weights
+            d_out = F.interpolate(d_out, size=d_shape[1], mode='linear')
+            
+            # Apply position-dependent correction factors based on observed reconstruction biases
+            seq_len = d_shape[1]
+            position = torch.linspace(0, 1, seq_len, device=d_out.device).view(1, 1, -1)
+            
+            if j == 0:  # Level 1 (80% left reconstruction) - apply strong correction to right side
+                # Corrective mask: increase gain on right side (1.0 → 3.0)
+                correction = 1.0 + 2.0 * torch.pow(position, 2.0)  # Quadratic increase to right
+            elif j == 1:  # Level 2 (50% right reconstruction) - apply correction to left side
+                # Corrective mask: increase gain on left side (2.5 → 1.0)
+                correction = 2.5 - 1.5 * position  # Linear decrease to right
+            elif j == 2:  # Level 3 (30% right reconstruction) - strong left boost
+                # Corrective mask: strong emphasis on left side (3.0 → 1.0)
+                correction = 3.0 - 2.0 * torch.pow(position, 0.7)  # Non-linear decrease to right
             else:
-                d_out = F.interpolate(d_out, size=d_shape[1])
+                correction = torch.ones_like(position)
                 
+            # Expand correction to batch dimension
+            correction = correction.expand(batch_size, 1, -1)
+                
+            # Apply the correction factors
+            d_out = d_out * correction
             d_out = d_out.squeeze(1)
             d_outs.append(d_out)
         
