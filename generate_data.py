@@ -6,18 +6,24 @@ from tqdm import tqdm
 import yaml
 from utils.utils import load_config
 
-def generate_audio_data(n_samples, sample_rate, duration):
+def generate_audio_data(n_samples, sample_rate, audio_length):
     """Generate synthetic audio data for testing
     
     Creates sinusoidal signals with harmonics following the equation:
     s(t) = sin(2πft) + 0.5sin(4πft) + 0.25sin(6πft) + noise
     where f is randomly selected between 200-2000 Hz
+    
+    Args:
+        n_samples: Number of audio samples to generate
+        sample_rate: Sampling rate in Hz
+        audio_length: Number of samples per audio clip
     """
+    duration = audio_length / sample_rate
     data = []
     for i in tqdm(range(n_samples), desc="Generating audio"):
         # Generate a sinusoidal signal with random frequency
         freq = np.random.uniform(200, 2000)
-        t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+        t = np.linspace(0, duration, audio_length, endpoint=False)
         
         # Add some harmonics for complexity
         signal = np.sin(2 * np.pi * freq * t)
@@ -57,10 +63,13 @@ def main():
     
     # Generate training data
     print("Generating training data...")
+    print(f"Audio settings: {config.audio_length} samples at {config.sample_rate} Hz")
+    print(f"Duration per clip: {config.audio_length/config.sample_rate:.2f} seconds")
+    
     train_data = generate_audio_data(
         config.n_training_samples,
         config.sample_rate,
-        config.audio_length / config.sample_rate
+        config.audio_length
     )
     save_to_h5(train_data, os.path.join(args.output_dir, 'train.h5'))
     
@@ -69,7 +78,7 @@ def main():
     test_data = generate_audio_data(
         config.n_test_samples,
         config.sample_rate,
-        config.audio_length / config.sample_rate
+        config.audio_length
     )
     save_to_h5(test_data, os.path.join(args.output_dir, 'test.h5'))
     

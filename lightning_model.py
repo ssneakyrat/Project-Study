@@ -27,11 +27,10 @@ class WaveletAudioAE(pl.LightningModule):
             level=config.dwt_level
         )
         
-        # Get input dimension from a dummy forward pass
-        dummy_audio = torch.zeros(1, config.audio_length)
-        wavelet_coeffs = self.wavelet_transform.forward(dummy_audio)
-        self.input_dim = wavelet_coeffs.shape[1]
+        # Get input dimension from wavelet transform based on audio_length
+        self.input_dim = self.wavelet_transform.get_output_dim(config.audio_length)
         
+        print(f"Audio length: {config.audio_length} samples")
         print(f"Wavelet coefficients dimension: {self.input_dim}")
         
         # Create autoencoder
@@ -55,10 +54,11 @@ class WaveletAudioAE(pl.LightningModule):
         # Apply inverse transform
         x_recon = self.wavelet_transform.inverse(wavelet_coeffs_recon)
         
-        # Ensure same length
-        min_len = min(x.shape[1], x_recon.shape[1])
-        x = x[:, :min_len]
-        x_recon = x_recon[:, :min_len]
+        # Ensure same length (shouldn't be needed with improved wavelet transform)
+        if x.shape[1] != x_recon.shape[1]:
+            min_len = min(x.shape[1], x_recon.shape[1])
+            x = x[:, :min_len]
+            x_recon = x_recon[:, :min_len]
         
         return x_recon, wavelet_coeffs, wavelet_coeffs_recon, z
     
@@ -83,8 +83,8 @@ class WaveletAudioAE(pl.LightningModule):
         self.log('train_wavelet_loss', wavelet_loss)
         self.log('train_snr', avg_snr)
         
-        # Periodically log audio and visualizations
-        if batch_idx % 10 == 0 or batch_idx == 0:
+        # Periodically log audio and visualizations (less frequently to save resources)
+        if (self.global_step % 50 == 0 or batch_idx == 0) and self.global_step > 0:
             self._log_audio_and_visualizations(x, x_recon, wavelet_coeffs, wavelet_coeffs_recon)
         
         return loss
@@ -113,10 +113,7 @@ class WaveletAudioAE(pl.LightningModule):
         return loss
         
     def test_step(self, batch, batch_idx):
-        """Test step for model evaluation
-        
-        Using same metrics as validation but with 'test_' prefix
-        """
+        """Test step for model evaluation"""
         x = batch
         x_recon, wavelet_coeffs, wavelet_coeffs_recon, _ = self(x)
         
@@ -144,6 +141,7 @@ class WaveletAudioAE(pl.LightningModule):
         return loss
     
     def _log_audio_and_visualizations(self, x, x_recon, wavelet_coeffs, wavelet_coeffs_recon):
+        """Log audio samples and visualizations to TensorBoard"""
         # Get first sample from batch
         sample_idx = 0
         
@@ -173,13 +171,17 @@ class WaveletAudioAE(pl.LightningModule):
         axs[0, 1].plot(x_recon[sample_idx].cpu().numpy())
         axs[0, 1].set_title('Reconstructed Waveform')
         
-        # Original wavelet coefficients
-        axs[1, 0].plot(wavelet_coeffs[sample_idx].cpu().numpy())
-        axs[1, 0].set_title('Original Wavelet Coefficients')
+        # Original wavelet coefficients (plot only a subset if too large)
+        coeffs = wavelet_coeffs[sample_idx].cpu().numpy()
+        plot_coeffs = coeffs[:min(1000, len(coeffs))]
+        axs[1, 0].plot(plot_coeffs)
+        axs[1, 0].set_title(f'Original Wavelet Coefficients (showing {len(plot_coeffs)} of {len(coeffs)})')
         
-        # Reconstructed wavelet coefficients
-        axs[1, 1].plot(wavelet_coeffs_recon[sample_idx].cpu().detach().numpy())
-        axs[1, 1].set_title('Reconstructed Wavelet Coefficients')
+        # Reconstructed wavelet coefficients (same subset)
+        recon_coeffs = wavelet_coeffs_recon[sample_idx].cpu().detach().numpy()
+        plot_recon_coeffs = recon_coeffs[:min(1000, len(recon_coeffs))]
+        axs[1, 1].plot(plot_recon_coeffs)
+        axs[1, 1].set_title(f'Reconstructed Wavelet Coefficients (showing {len(plot_recon_coeffs)} of {len(recon_coeffs)})')
         
         plt.tight_layout()
         
@@ -191,11 +193,11 @@ class WaveletAudioAE(pl.LightningModule):
         )
         plt.close(fig)
         
-        # Plot spectrogram comparison if step is a multiple of 20
-        if self.global_step % 20 == 0:
+        # Plot spectrogram comparison periodically (less frequently to save resources)
+        if self.global_step % 100 == 0:
             # Compute spectrograms using FFT
-            n_fft = 1024
-            hop_length = 256
+            n_fft = min(1024, self.config.audio_length // 4)  # Adjust based on audio length
+            hop_length = n_fft // 4
             
             x_np = x[sample_idx].cpu().numpy()
             x_recon_np = x_recon[sample_idx].cpu().numpy()

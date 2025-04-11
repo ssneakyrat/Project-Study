@@ -1,6 +1,6 @@
 # Audio settings
 sample_rate: 16000
-audio_length: 16000  # 1 second
+audio_length: 32000 #16000  # 1 second
 
 # Dataset settings
 n_training_samples: 100
